@@ -46,8 +46,12 @@ async def warmup(n: int):
 
 
 # ── Single request ───────────────────────────────────────────────────────
-async def run_request() -> dict:
-    """Run one streaming request, capturing wall time, TTFT, and tok/s."""
+async def run_request(i: int) -> dict:
+    """Run one streaming request, capturing wall time, TTFT, and tok/s.
+
+    Prints i once per token received, so you can see which of the N
+    concurrent requests is actively streaming at any moment.
+    """
     output_tokens = 0
     eval_duration_ns = 0
     ttft = None
@@ -59,6 +63,8 @@ async def run_request() -> dict:
         stream=True,
         options={"temperature": 0.0},
     ):
+        if chunk.get("message", {}).get("content"):
+            print(i, end=" ", flush=True)
         if ttft is None and chunk.get("message", {}).get("content"):
             ttft = time.perf_counter() - start
         if chunk.get("done"):
@@ -80,7 +86,8 @@ async def run_request() -> dict:
 async def run_batch(n: int) -> dict:
     """Fire n concurrent requests, return per-request results + batch throughput."""
     batch_start = time.perf_counter()
-    results = await asyncio.gather(*[run_request() for _ in range(n)])
+    results = await asyncio.gather(*[run_request(i) for i in range(1, n + 1)])
+    print()  # newline after the interleaved token-index output
     batch_time = time.perf_counter() - batch_start
 
     total_tokens = sum(r["output_tokens"] for r in results)
