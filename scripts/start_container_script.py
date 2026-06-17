@@ -2,22 +2,35 @@
 set -e
 
 # ==========================================
-# Positional Arguments
+# Usage
 # ==========================================
 #
-# Usage:
-#   bash ./deploy_ollama.sh <num_parallel> <max_loaded_models> <api_port> <web_port> <enable_web_port> [--force-recreate]
+# bash ./deploy_ollama.sh [OPTIONS]
+#
+# Options:
+#   --num-parallel <n>          OLLAMA_NUM_PARALLEL (default: 8)
+#   --max-loaded-models <n>     OLLAMA_MAX_LOADED_MODELS (default: 3)
+#   --api-port <port>           Host port for the Ollama API (default: 11440)
+#   --web-port <port>           Host port for the web UI (default: 3004)
+#   --enable-web-port <bool>    Whether to publish the web port: true|false (default: true)
+#   --force-recreate            Remove and recreate any model that already exists
+#   -h, --help                  Show this help message and exit
 #
 # Examples:
-#   bash ./deploy_ollama.sh 8 3 11440 3004 true
-#   bash ./deploy_ollama.sh 4 3 11441 3005 true --force-recreate
+#   bash ./deploy_ollama.sh --num-parallel 8 --max-loaded-models 3 --api-port 11440 --web-port 3004
+#   bash ./deploy_ollama.sh --api-port 11441 --web-port 3005 --force-recreate
 #
 
-OLLAMA_NUM_PARALLEL="${1:-8}"
-OLLAMA_MAX_LOADED_MODELS="${2:-3}"
-HOST_API_PORT="${3:-11440}"
-HOST_WEB_PORT="${4:-3004}"
-ENABLE_WEB_PORT="${5:-true}"
+# ==========================================
+# Defaults
+# ==========================================
+
+OLLAMA_NUM_PARALLEL=8
+OLLAMA_MAX_LOADED_MODELS=3
+HOST_API_PORT=11440
+HOST_WEB_PORT=3004
+ENABLE_WEB_PORT=true
+FORCE_RECREATE_MODELS=false
 
 # ==========================================
 # Configuration Variables
@@ -35,21 +48,126 @@ OLLAMA_CONTAINER_IMAGE="docker.io/ollama/ollama:0.18.3"
 # Persistent Ollama storage on host/server
 OLLAMA_STORAGE_BIND="/ollama_storage"
 
+# ==========================================
+# Helper Functions (defined early; needed by arg parsing)
+# ==========================================
+
+print_usage() {
+    cat <<'EOF'
+Usage: bash ./deploy_ollama.sh [OPTIONS]
+
+Options:
+  --num-parallel <n>          OLLAMA_NUM_PARALLEL (default: 8)
+  --max-loaded-models <n>     OLLAMA_MAX_LOADED_MODELS (default: 3)
+  --api-port <port>           Host port for the Ollama API (default: 11440)
+  --web-port <port>           Host port for the web UI (default: 3004)
+  --enable-web-port <bool>    Whether to publish the web port: true|false (default: true)
+  --force-recreate            Remove and recreate any model that already exists
+  -h, --help                  Show this help message and exit
+
+Examples:
+  bash ./deploy_ollama.sh --num-parallel 8 --max-loaded-models 3 --api-port 11440 --web-port 3004
+  bash ./deploy_ollama.sh --api-port 11441 --web-port 3005 --force-recreate
+EOF
+}
+
+is_positive_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_bool() {
+    [ "$1" = "true" ] || [ "$1" = "false" ]
+}
+
+require_value() {
+    local flag="$1"
+    local value="$2"
+    if [ -z "$value" ]; then
+        echo "ERROR: ${flag} requires a value." >&2
+        print_usage
+        exit 1
+    fi
+}
+
+# ==========================================
+# Argument Parsing (flags only — no positional args)
+# ==========================================
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --num-parallel)
+            require_value "$1" "$2"
+            OLLAMA_NUM_PARALLEL="$2"
+            shift 2
+            ;;
+        --max-loaded-models)
+            require_value "$1" "$2"
+            OLLAMA_MAX_LOADED_MODELS="$2"
+            shift 2
+            ;;
+        --api-port)
+            require_value "$1" "$2"
+            HOST_API_PORT="$2"
+            shift 2
+            ;;
+        --web-port)
+            require_value "$1" "$2"
+            HOST_WEB_PORT="$2"
+            shift 2
+            ;;
+        --enable-web-port)
+            require_value "$1" "$2"
+            ENABLE_WEB_PORT="$2"
+            shift 2
+            ;;
+        --force-recreate)
+            FORCE_RECREATE_MODELS=true
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $1" >&2
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+
+# ==========================================
+# Argument Validation
+# ==========================================
+
+if ! is_positive_int "$OLLAMA_NUM_PARALLEL"; then
+    echo "ERROR: --num-parallel must be a positive integer, got: ${OLLAMA_NUM_PARALLEL}" >&2
+    exit 1
+fi
+
+if ! is_positive_int "$OLLAMA_MAX_LOADED_MODELS"; then
+    echo "ERROR: --max-loaded-models must be a positive integer, got: ${OLLAMA_MAX_LOADED_MODELS}" >&2
+    exit 1
+fi
+
+if ! is_positive_int "$HOST_API_PORT"; then
+    echo "ERROR: --api-port must be a positive integer, got: ${HOST_API_PORT}" >&2
+    exit 1
+fi
+
+if ! is_positive_int "$HOST_WEB_PORT"; then
+    echo "ERROR: --web-port must be a positive integer, got: ${HOST_WEB_PORT}" >&2
+    exit 1
+fi
+
+if ! is_bool "$ENABLE_WEB_PORT"; then
+    echo "ERROR: --enable-web-port must be 'true' or 'false', got: ${ENABLE_WEB_PORT}" >&2
+    exit 1
+fi
+
 # Name of your container (includes ports so multiple instances with the
 # same parallel/loaded-model settings but different ports don't collide)
 CONTAINER_NAME="ollama_np${OLLAMA_NUM_PARALLEL}_mlm${OLLAMA_MAX_LOADED_MODELS}_api${HOST_API_PORT}"
-
-# ==========================================
-# CLI Flags
-# ==========================================
-
-FORCE_RECREATE_MODELS=false
-
-for arg in "$@"; do
-    if [ "$arg" = "--force-recreate" ]; then
-        FORCE_RECREATE_MODELS=true
-    fi
-done
 
 # ==========================================
 # Helper Functions
