@@ -1,11 +1,12 @@
 """
 benchmark_vram.py
 ==================
-Measures VRAM usage for a single Ollama model across three sweeps:
-concurrency (N), context window size (num_ctx), and prompt length
-(padding). Model is unloaded before each measurement for a clean read.
-VRAM is read via `ollama ps`, which reports only what this Ollama
-instance has loaded (unaffected by other processes sharing the GPU).
+Measures VRAM usage for a single Ollama model across six sweeps:
+concurrency (N) at min and max num_ctx, context window size (num_ctx)
+at N=1 and N=max, and prompt length (padding) at min and max num_ctx.
+Model is unloaded before each measurement for a clean read. VRAM is
+read via `ollama ps`, which reports only what this Ollama instance
+has loaded (unaffected by other processes sharing the GPU).
 """
 
 import asyncio
@@ -70,52 +71,66 @@ async def measure_batch(n, num_ctx=None, pad_words=0):
 
 
 # ── Sweeps ──────────────────────────────────────────────────────────────
-async def sweep_concurrency():
-    print("Concurrency sweep...")
+async def sweep_concurrency(num_ctx):
+    print(f"Concurrency sweep (num_ctx={num_ctx})...")
     vram = []
     for n in N_LIST:
-        v = await measure_batch(n, num_ctx=8192)
+        v = await measure_batch(n, num_ctx=num_ctx)
         vram.append(v)
         print(f"  N={n:2d}  vram={v:.0f}MB")
     return vram
 
 
-async def sweep_num_ctx():
-    print("num_ctx sweep...")
+async def sweep_num_ctx(n=1):
+    print(f"num_ctx sweep (N={n})...")
     vram = []
     for ctx in CTX_LIST:
-        v = await measure_batch(1, num_ctx=ctx)
+        v = await measure_batch(n, num_ctx=ctx)
         vram.append(v)
         print(f"  num_ctx={ctx:6d}  vram={v:.0f}MB")
     return vram
 
 
-async def sweep_prompt_padding():
-    print("Prompt padding sweep...")
+async def sweep_prompt_padding(num_ctx):
+    print(f"Prompt padding sweep (num_ctx={num_ctx})...")
     vram = []
     for pad in PAD_LIST:
-        v = await measure_batch(1, num_ctx=max(CTX_LIST), pad_words=pad)
+        v = await measure_batch(1, num_ctx=num_ctx, pad_words=pad)
         vram.append(v)
         print(f"  pad_words={pad:6d}  vram={v:.0f}MB")
     return vram
 
 
 # ── Plotting ────────────────────────────────────────────────────────────
-def plot_results(concurrency_vram, ctx_vram, padding_vram):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+def plot_results(conc_min, conc_max, ctx_vram_n1, ctx_vram_nmax, pad_min, pad_max):
+    ctx_min, ctx_max = min(CTX_LIST), max(CTX_LIST)
+    fig, axes = plt.subplots(3, 2, figsize=(12, 15))
     fig.suptitle(f"VRAM Usage — {MODEL}")
+    axes = axes.flatten()
 
-    axes[0].plot(N_LIST, concurrency_vram, marker="o")
-    axes[0].set_title("VRAM vs. Concurrency (num_ctx=8192)")
+    axes[0].plot(N_LIST, conc_min, marker="o")
+    axes[0].set_title(f"VRAM vs. Concurrency (num_ctx={ctx_min})")
     axes[0].set_xlabel("Concurrent requests (N)")
 
-    axes[1].plot(CTX_LIST, ctx_vram, marker="o")
-    axes[1].set_title("VRAM vs. num_ctx (N=1)")
-    axes[1].set_xlabel("num_ctx (tokens)")
+    axes[1].plot(N_LIST, conc_max, marker="o")
+    axes[1].set_title(f"VRAM vs. Concurrency (num_ctx={ctx_max})")
+    axes[1].set_xlabel("Concurrent requests (N)")
 
-    axes[2].plot(PAD_LIST, padding_vram, marker="o")
-    axes[2].set_title(f"VRAM vs. Prompt Length (num_ctx={max(CTX_LIST)})")
-    axes[2].set_xlabel("Extra input words")
+    axes[2].plot(CTX_LIST, ctx_vram_n1, marker="o")
+    axes[2].set_title("VRAM vs. num_ctx (N=1)")
+    axes[2].set_xlabel("num_ctx (tokens)")
+
+    axes[3].plot(CTX_LIST, ctx_vram_nmax, marker="o")
+    axes[3].set_title(f"VRAM vs. num_ctx (N={max(N_LIST)})")
+    axes[3].set_xlabel("num_ctx (tokens)")
+
+    axes[4].plot(PAD_LIST, pad_min, marker="o")
+    axes[4].set_title(f"VRAM vs. Prompt Length (num_ctx={ctx_min})")
+    axes[4].set_xlabel("Extra input words")
+
+    axes[5].plot(PAD_LIST, pad_max, marker="o")
+    axes[5].set_title(f"VRAM vs. Prompt Length (num_ctx={ctx_max})")
+    axes[5].set_xlabel("Extra input words")
 
     for ax in axes:
         ax.set_ylabel("VRAM used (MB)")
@@ -129,11 +144,16 @@ def plot_results(concurrency_vram, ctx_vram, padding_vram):
 
 # ── Main ────────────────────────────────────────────────────────────────
 async def main():
-    concurrency_vram = await sweep_concurrency()
-    ctx_vram = await sweep_num_ctx()
-    padding_vram = await sweep_prompt_padding()
+    ctx_min, ctx_max = min(CTX_LIST), max(CTX_LIST)
 
-    plot_results(concurrency_vram, ctx_vram, padding_vram)
+    conc_min = await sweep_concurrency(num_ctx=ctx_min)
+    conc_max = await sweep_concurrency(num_ctx=ctx_max)
+    ctx_vram_n1 = await sweep_num_ctx(n=1)
+    ctx_vram_nmax = await sweep_num_ctx(n=max(N_LIST))
+    pad_min = await sweep_prompt_padding(num_ctx=ctx_min)
+    pad_max = await sweep_prompt_padding(num_ctx=ctx_max)
+
+    plot_results(conc_min, conc_max, ctx_vram_n1, ctx_vram_nmax, pad_min, pad_max)
 
 
 if __name__ == "__main__":
