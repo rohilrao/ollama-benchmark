@@ -2,22 +2,32 @@
 set -e
 
 # ==========================================
+# Positional Arguments
+# ==========================================
+#
+# Usage:
+#   bash ./deploy_ollama.sh <num_parallel> <max_loaded_models> <api_port> <web_port> <enable_web_port> [--force-recreate]
+#
+# Examples:
+#   bash ./deploy_ollama.sh 8 3 11440 3004 true
+#   bash ./deploy_ollama.sh 4 3 11441 3005 true --force-recreate
+#
+
+OLLAMA_NUM_PARALLEL="${1:-8}"
+OLLAMA_MAX_LOADED_MODELS="${2:-3}"
+HOST_API_PORT="${3:-11440}"
+HOST_WEB_PORT="${4:-3004}"
+ENABLE_WEB_PORT="${5:-true}"
+
+# ==========================================
 # Configuration Variables
 # ==========================================
 
 SRC_DIR="/ollama-models"
 
-# Host ports
-HOST_API_PORT="11440"
-HOST_WEB_PORT="3004"
-ENABLE_WEB_PORT=true
-
-# Ollama Runtime Settings
-OLLAMA_NUM_PARALLEL="8"
-OLLAMA_MAX_LOADED_MODELS="3"
-
 # Deployment Settings
 API_WAIT_TIME=5
+OLLAMA_READY_TIMEOUT=60
 
 # Container image
 OLLAMA_CONTAINER_IMAGE="docker.io/ollama/ollama:0.18.3"
@@ -25,10 +35,21 @@ OLLAMA_CONTAINER_IMAGE="docker.io/ollama/ollama:0.18.3"
 # Persistent Ollama storage on host/server
 OLLAMA_STORAGE_BIND="/ollama_storage"
 
-# add random number to container name
+# Name of your container (includes ports so multiple instances with the
+# same parallel/loaded-model settings but different ports don't collide)
+CONTAINER_NAME="ollama_np${OLLAMA_NUM_PARALLEL}_mlm${OLLAMA_MAX_LOADED_MODELS}_api${HOST_API_PORT}"
 
-# Name of your container
-CONTAINER_NAME="ollama_np${OLLAMA_NUM_PARALLEL}_mlm${OLLAMA_MAX_LOADED_MODELS}"
+# ==========================================
+# CLI Flags
+# ==========================================
+
+FORCE_RECREATE_MODELS=false
+
+for arg in "$@"; do
+    if [ "$arg" = "--force-recreate" ]; then
+        FORCE_RECREATE_MODELS=true
+    fi
+done
 
 # ==========================================
 # Helper Functions
@@ -47,6 +68,73 @@ container_running() {
     podman ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"
 }
 
+normalize_model_name() {
+    local model_name="$1"
+
+    if [[ "$model_name" != *":"* ]]; then
+        echo "${model_name}:latest"
+    else
+        echo "$model_name"
+    fi
+}
+
+# Takes the already-normalized lookup name to avoid recomputing it
+model_exists() {
+    local lookup_name="$1"
+
+    podman exec "${CONTAINER_NAME}" ollama list \
+        | awk 'NR>1 {print $1}' \
+        | grep -qx "${lookup_name}"
+}
+
+wait_for_ollama() {
+    echo "Waiting for Ollama to become ready..."
+
+    local elapsed=0
+
+    until podman exec "${CONTAINER_NAME}" ollama list >/dev/null 2>&1; do
+        if [ "$elapsed" -ge "$OLLAMA_READY_TIMEOUT" ]; then
+            echo "ERROR: Ollama did not become ready within ${OLLAMA_READY_TIMEOUT} seconds."
+            exit 1
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    echo "Ollama is ready."
+}
+
+create_or_reuse_model() {
+    local tag_name="$1"
+    local folder_name="$2"
+    local modelfile_path="/root/models/${folder_name}/Modelfile"
+    local lookup_name
+    lookup_name=$(normalize_model_name "$tag_name")
+
+    if model_exists "$lookup_name"; then
+        if [ "$FORCE_RECREATE_MODELS" = true ]; then
+            echo "Force recreate enabled. Removing existing model: ${lookup_name}"
+
+            podman exec "${CONTAINER_NAME}" ollama rm "${lookup_name}" || true
+
+            echo "Recreating model: ${tag_name} from ${folder_name}..."
+
+            podman exec "${CONTAINER_NAME}" \
+                ollama create "${tag_name}" \
+                -f "${modelfile_path}"
+        else
+            echo "Model already exists: ${lookup_name}. Skipping create."
+        fi
+    else
+        echo "Model missing. Creating model: ${tag_name} from ${folder_name}..."
+
+        podman exec "${CONTAINER_NAME}" \
+            ollama create "${tag_name}" \
+            -f "${modelfile_path}"
+    fi
+}
+
 # ==========================================
 # 0. Pre-flight Checks
 # ==========================================
@@ -54,6 +142,23 @@ container_running() {
 echo ""
 echo "##### Starting container ######"
 echo "Running pre-flight checks..."
+echo ""
+echo "Resolved configuration:"
+echo "OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL}"
+echo "OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS}"
+echo "HOST_API_PORT=${HOST_API_PORT}"
+echo "HOST_WEB_PORT=${HOST_WEB_PORT}"
+echo "ENABLE_WEB_PORT=${ENABLE_WEB_PORT}"
+echo "CONTAINER_NAME=${CONTAINER_NAME}"
+echo ""
+
+if [ "$FORCE_RECREATE_MODELS" = true ]; then
+    echo "FORCE_RECREATE_MODELS=true"
+    echo "Existing model tags will be removed and recreated from Modelfiles."
+else
+    echo "FORCE_RECREATE_MODELS=false"
+    echo "Existing model tags will be reused."
+fi
 
 if [ ! -d "$SRC_DIR" ]; then
     echo "ERROR: SRC_DIR does not exist: $SRC_DIR"
@@ -88,11 +193,9 @@ else
 fi
 
 if container_running; then
-    echo "WARNING: A running container named '${CONTAINER_NAME}' already exists."
-    echo "Because --replace is used, it will be replaced."
+    echo "NOTE: A running container named '${CONTAINER_NAME}' already exists and will be replaced (--replace)."
 elif container_exists; then
-    echo "WARNING: A stopped container named '${CONTAINER_NAME}' already exists."
-    echo "Because --replace is used, it will be replaced."
+    echo "NOTE: A stopped container named '${CONTAINER_NAME}' already exists and will be replaced (--replace)."
 fi
 
 if ! find "$SRC_DIR" -mindepth 2 -maxdepth 2 -name "Modelfile" | grep -q .; then
@@ -106,13 +209,12 @@ echo "Pre-flight checks complete."
 # ==========================================
 # 1. Start the Container
 # ==========================================
+
 echo ""
 echo "Starting Ollama container: ${CONTAINER_NAME}"
 echo ""
 echo "Mounting source models from: ${SRC_DIR}"
-echo ""
 echo "Using persistent Ollama storage folder: ${OLLAMA_STORAGE_BIND}"
-echo ""
 echo "Ollama API: http://localhost:${HOST_API_PORT}"
 echo ""
 echo "##### OLLAMA ENV VARIABLES: #####"
@@ -128,29 +230,29 @@ if [ "$ENABLE_WEB_PORT" = true ]; then
 fi
 
 podman run -d \
-  "${PORT_ARGS[@]}" \
-  -e OLLAMA_HOST=0.0.0.0 \
-  -e OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL}" \
-  -e OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS}" \
-  -v "${SRC_DIR}:/root/models:ro" \
-  -v "${OLLAMA_STORAGE_BIND}:/root/.ollama" \
-  --device nvidia.com/gpu=all \
-  --name "${CONTAINER_NAME}" \
-  --replace \
-  "${OLLAMA_CONTAINER_IMAGE}"
+    "${PORT_ARGS[@]}" \
+    -e OLLAMA_HOST=0.0.0.0 \
+    -e OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL}" \
+    -e OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS}" \
+    -v "${SRC_DIR}:/root/models:ro" \
+    -v "${OLLAMA_STORAGE_BIND}:/root/.ollama" \
+    --device nvidia.com/gpu=all \
+    --name "${CONTAINER_NAME}" \
+    --replace \
+    "${OLLAMA_CONTAINER_IMAGE}"
 
 # ==========================================
 # 2. Wait for Service Initialization
 # ==========================================
 
-echo "Waiting ${API_WAIT_TIME} seconds for Ollama to initialize..."
 sleep "${API_WAIT_TIME}"
-
+wait_for_ollama
 
 # ==========================================
-# 3. Build the Models
+# 3. Create Missing Models / Reuse Existing Models
 # ==========================================
 
+echo ""
 echo "Scanning for Modelfiles in ${SRC_DIR}..."
 
 for model_dir in "${SRC_DIR}"/*/; do
@@ -178,18 +280,22 @@ for model_dir in "${SRC_DIR}"/*/; do
                 ;;
         esac
 
-        echo "Creating model: ${tag_name} from ${folder_name}..."
-
-        podman exec "${CONTAINER_NAME}" \
-          ollama create "${tag_name}" \
-          -f "/root/models/${folder_name}/Modelfile"
+        create_or_reuse_model "$tag_name" "$folder_name"
     fi
 done
 
+# ==========================================
+# 4. Done
+# ==========================================
 
+echo ""
 echo "Deployment complete."
+echo ""
 echo "Check models with:"
-echo "podman exec ${CONTAINER_NAME} ollama list" 
-
-
-
+echo "podman exec ${CONTAINER_NAME} ollama list"
+echo ""
+echo "Check running loaded models with:"
+echo "podman exec ${CONTAINER_NAME} ollama ps"
+echo ""
+echo "API endpoint:"
+echo "http://localhost:${HOST_API_PORT}"
