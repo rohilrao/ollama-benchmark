@@ -2,20 +2,32 @@ python -c '
 import asyncio
 from ollama import AsyncClient
 
-async def main():
-    client = AsyncClient(host="http://localhost:11440")
-    print("Connecting and waiting for stream...\n")
+async def run_single_request(client, req_id):
+    prompt = f"Count from 1 to 5. (Request {req_id})"
+    token_count = 0
     
     async for chunk in await client.chat(
-        model="mistral-small3.2:24b-32k", 
-        messages=[{"role": "user", "content": "Count from 1 to 5."}], 
+        model="mistral-small3.2:24b", 
+        messages=[{"role": "user", "content": prompt}], 
         stream=True
     ):
-        # Extract the content and wrap it in brackets to visualize the chunks
         content = chunk.get("message", {}).get("content", "")
-        print(f"|{content}|", end="", flush=True)
+        if content:  # Only count/print if there is actual text
+            token_count += 1
+            # Format: [ReqID - TokenNum: |text|]
+            print(f"[R{req_id}-T{token_count}:|{content}|] ", end="", flush=True)
+
+async def main():
+    client = AsyncClient(host="http://localhost:11440")
+    print("Launching 5 concurrent streams...\n")
+    
+    # 1. Create a list of 5 paused tasks
+    tasks = [run_single_request(client, i) for i in range(1, 6)]
+    
+    # 2. Fire them all off to the Ollama server at the exact same time
+    await asyncio.gather(*tasks)
         
-    print("\n\n[Stream Complete]")
+    print("\n\n[All Streams Complete]")
 
 asyncio.run(main())
 '
