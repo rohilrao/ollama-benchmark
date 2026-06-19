@@ -31,3 +31,18 @@ async def main():
 
 asyncio.run(main())
 '
+
+##
+
+python -c 'import ollama
+stream = ollama.chat(
+    model="qwen3",
+    messages=[{"role":"user","content":"Explain KV caching in 3 sentences."}],
+    think=True,
+    stream=True,
+)
+for chunk in stream:
+    msg = chunk.get("message", {})
+    print(msg.get("thinking", ""), end="", flush=True)
+    print(msg.get("content", ""), end="", flush=True)
+print()'
