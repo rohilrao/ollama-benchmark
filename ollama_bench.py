@@ -4,26 +4,19 @@ ollama_bench.py
 Class-based refactor of vram_bench.py and latency_bench.py.
 
 - OllamaBenchmarkBase: shared client setup, prompt building, CSV saving, plot saving.
-- VRAMBenchmark: measures VRAM usage across concurrency / num_ctx / prompt-padding sweeps.
-  Unloads the model before every measurement for a clean read. No warmup (intentionally).
-- LatencyBenchmark: measures wall time, TTFT, and tok/s across a concurrency sweep.
-  Warms up the model once before sweeping. No unloading (intentionally).
+- VRAMBenchmark: full grid search over (n, num_ctx, pad_words). Model is unloaded
+  before every measurement for a clean read. No warmup (intentionally).
+- LatencyBenchmark: sweeps concurrency (n), warms up the model once beforehand.
+  Streams both "thinking" and "content" tokens (reasoning models emit both),
+  and reports them separately in the latency metrics.
 
-Usage (see bottom of file for a runnable example):
-
-    vram_bench = VRAMBenchmark(host=..., model=..., output_dir="./results/vram")
-    rows = await vram_bench.run_all()
-    vram_bench.save_results(rows)
-    vram_bench.plot_results(rows)
-
-    latency_bench = LatencyBenchmark(host=..., model=..., output_dir="./results/latency")
-    summary = await latency_bench.run_all()
-    latency_bench.save_results(summary)
-    latency_bench.plot_results(summary)
+See the bottom of this file for a runnable example with explicit grid/sweep
+parameters.
 """
 
 import asyncio
 import csv
+import itertools
 import os
 import statistics
 import time
@@ -82,12 +75,35 @@ class OllamaBenchmarkBase:
         fig.savefig(path, dpi=150)
         self._log(f"Saved plot → {path}")
 
+    @staticmethod
+    def _stream_tokens(chunk: dict, i: int, token_index: int, log_fn) -> tuple:
+        """
+        Reads a streamed chat chunk and logs both reasoning ("thinking") and
+        regular ("content") tokens, since reasoning models can emit both in
+        the same stream. Returns (token_index, got_thinking, got_content).
+        """
+        message = chunk.get("message", {})
+        thinking = message.get("thinking", "")
+        content = message.get("content", "")
+
+        got_thinking = bool(thinking)
+        got_content = bool(content)
+
+        if got_thinking:
+            token_index += 1
+            log_fn(f"[R{i},T{token_index},thinking]: {thinking.strip()}", end=" | ", flush=True)
+        if got_content:
+            token_index += 1
+            log_fn(f"[R{i},T{token_index},content]: {content.strip()}", end=" | ", flush=True)
+
+        return token_index, got_thinking, got_content
+
 
 # ── VRAM benchmark ────────────────────────────────────────────────────────
 class VRAMBenchmark(OllamaBenchmarkBase):
     """
-    Measures VRAM usage for a single model across concurrency, num_ctx, and
-    prompt-padding sweeps. Model is unloaded before each measurement; no warmup.
+    Measures VRAM usage for a single model across a full grid search of
+    (n, num_ctx, pad_words). Model is unloaded before each measurement; no warmup.
     """
 
     def __init__(self, host: str, model: str, output_dir: str = ".", verbose: bool = True,
@@ -121,10 +137,7 @@ class VRAMBenchmark(OllamaBenchmarkBase):
             stream=True,
             options=options,
         ):
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                token_index += 1
-                self._log(f"[R{i},T{token_index}]: {content.strip()}", end=" | ", flush=True)
+            token_index, _, _ = self._stream_tokens(chunk, i, token_index, self._log)
 
     async def measure_batch(self, n: int, num_ctx: int = None, pad_words: int = 0) -> float:
         await self.unload_model()
@@ -132,98 +145,47 @@ class VRAMBenchmark(OllamaBenchmarkBase):
         self._log("")
         return await self.ollama_vram_mb()
 
-    async def sweep_concurrency(self, num_ctx: int) -> list:
-        self._log(f"Concurrency sweep (num_ctx={num_ctx})...")
+    async def run_grid_search(self) -> list:
+        """
+        Full grid search over n_list x ctx_list x pad_list. Returns a list of dicts:
+        {n, num_ctx, pad_words, vram_mb}. Total measurements = len(n_list) * len(ctx_list)
+        * len(pad_list); each one does a full unload + full generation, so size your
+        lists accordingly before running a large grid unattended.
+        """
         rows = []
-        for n in self.n_list:
-            v = await self.measure_batch(n, num_ctx=num_ctx)
-            rows.append({"sweep_type": "concurrency", "n": n, "num_ctx": num_ctx,
-                         "pad_words": 0, "vram_mb": v})
-            self._log(f"  N={n:2d}  vram={v:.0f}MB")
-        return rows
-
-    async def sweep_num_ctx(self, n: int = 1) -> list:
-        self._log(f"num_ctx sweep (N={n})...")
-        rows = []
-        for ctx in self.ctx_list:
-            v = await self.measure_batch(n, num_ctx=ctx)
-            rows.append({"sweep_type": "num_ctx", "n": n, "num_ctx": ctx,
-                         "pad_words": 0, "vram_mb": v})
-            self._log(f"  num_ctx={ctx:6d}  vram={v:.0f}MB")
-        return rows
-
-    async def sweep_prompt_padding(self, num_ctx: int) -> list:
-        self._log(f"Prompt padding sweep (num_ctx={num_ctx})...")
-        rows = []
-        for pad in self.pad_list:
-            v = await self.measure_batch(1, num_ctx=num_ctx, pad_words=pad)
-            rows.append({"sweep_type": "padding", "n": 1, "num_ctx": num_ctx,
-                         "pad_words": pad, "vram_mb": v})
-            self._log(f"  pad_words={pad:6d}  vram={v:.0f}MB")
+        combos = list(itertools.product(self.n_list, self.ctx_list, self.pad_list))
+        self._log(f"Grid search: {len(combos)} combinations "
+                   f"({len(self.n_list)} x {len(self.ctx_list)} x {len(self.pad_list)})...")
+        for n, ctx, pad in combos:
+            v = await self.measure_batch(n, num_ctx=ctx, pad_words=pad)
+            rows.append({"n": n, "num_ctx": ctx, "pad_words": pad, "vram_mb": v})
+            self._log(f"  n={n:2d}  num_ctx={ctx:6d}  pad_words={pad:6d}  vram={v:.0f}MB")
         return rows
 
     async def run_all(self) -> list:
-        """Runs all six sweeps (matches original main()) and returns one combined list of rows."""
-        ctx_min, ctx_max = min(self.ctx_list), max(self.ctx_list)
-        rows = []
-        rows += await self.sweep_concurrency(ctx_min)
-        rows += await self.sweep_concurrency(ctx_max)
-        rows += await self.sweep_num_ctx(n=1)
-        rows += await self.sweep_num_ctx(n=max(self.n_list))
-        rows += await self.sweep_prompt_padding(ctx_min)
-        rows += await self.sweep_prompt_padding(ctx_max)
-        return rows
+        """Convenience alias for run_grid_search()."""
+        return await self.run_grid_search()
 
     def save_results(self, rows: list, filename: str = "vram_results.csv"):
         self.save_csv(rows, filename)
 
     def plot_results(self, rows: list, filename: str = "vram_benchmark.png"):
-        ctx_min, ctx_max = min(self.ctx_list), max(self.ctx_list)
-        n_max = max(self.n_list)
+        """One line per (num_ctx, pad_words) combination, VRAM vs N on the x-axis."""
+        combos = sorted(set((r["num_ctx"], r["pad_words"]) for r in rows))
 
-        def filt(sweep_type, **fixed):
-            return [r for r in rows if r["sweep_type"] == sweep_type
-                     and all(r[k] == v for k, v in fixed.items())]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for ctx, pad in combos:
+            sub = sorted([r for r in rows if r["num_ctx"] == ctx and r["pad_words"] == pad],
+                         key=lambda r: r["n"])
+            ax.plot([r["n"] for r in sub], [r["vram_mb"] for r in sub],
+                    marker="o", label=f"num_ctx={ctx}, pad_words={pad}")
 
-        conc_min = filt("concurrency", num_ctx=ctx_min)
-        conc_max = filt("concurrency", num_ctx=ctx_max)
-        ctx_n1 = filt("num_ctx", n=1)
-        ctx_nmax = filt("num_ctx", n=n_max)
-        pad_min = filt("padding", num_ctx=ctx_min)
-        pad_max = filt("padding", num_ctx=ctx_max)
-
-        fig, axes = plt.subplots(3, 2, figsize=(12, 15))
-        fig.suptitle(f"VRAM Usage — {self.model}")
-        axes = axes.flatten()
-
-        axes[0].plot([r["n"] for r in conc_min], [r["vram_mb"] for r in conc_min], marker="o")
-        axes[0].set_title(f"VRAM vs. Concurrency (num_ctx={ctx_min})")
-        axes[0].set_xlabel("Concurrent requests (N)")
-
-        axes[1].plot([r["n"] for r in conc_max], [r["vram_mb"] for r in conc_max], marker="o")
-        axes[1].set_title(f"VRAM vs. Concurrency (num_ctx={ctx_max})")
-        axes[1].set_xlabel("Concurrent requests (N)")
-
-        axes[2].plot([r["num_ctx"] for r in ctx_n1], [r["vram_mb"] for r in ctx_n1], marker="o")
-        axes[2].set_title("VRAM vs. num_ctx (N=1)")
-        axes[2].set_xlabel("num_ctx (tokens)")
-
-        axes[3].plot([r["num_ctx"] for r in ctx_nmax], [r["vram_mb"] for r in ctx_nmax], marker="o")
-        axes[3].set_title(f"VRAM vs. num_ctx (N={n_max})")
-        axes[3].set_xlabel("num_ctx (tokens)")
-
-        axes[4].plot([r["pad_words"] for r in pad_min], [r["vram_mb"] for r in pad_min], marker="o")
-        axes[4].set_title(f"VRAM vs. Prompt Length (num_ctx={ctx_min})")
-        axes[4].set_xlabel("Extra input words")
-
-        axes[5].plot([r["pad_words"] for r in pad_max], [r["vram_mb"] for r in pad_max], marker="o")
-        axes[5].set_title(f"VRAM vs. Prompt Length (num_ctx={ctx_max})")
-        axes[5].set_xlabel("Extra input words")
-
-        for ax in axes:
-            ax.set_ylabel("VRAM used (MB)")
-            ax.set_ylim(bottom=0)
-            ax.grid(True, alpha=0.3)
+        ax.set_title(f"VRAM Usage — {self.model}")
+        ax.set_xlabel("Concurrent requests (N)")
+        ax.set_ylabel("VRAM used (MB)")
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, ncol=2)
 
         self._save_plot(fig, filename)
 
@@ -233,6 +195,10 @@ class LatencyBenchmark(OllamaBenchmarkBase):
     """
     Measures full request latency for a single model under increasing concurrency.
     Warms up the model once before sweeping; never unloads it.
+
+    Reasoning models can stream both "thinking" and "content" tokens in the same
+    response (msg.get("thinking") / msg.get("content")). Both are streamed and
+    counted separately, and included in the latency metrics.
     """
 
     def __init__(self, host: str, model: str, output_dir: str = ".", verbose: bool = True,
@@ -251,11 +217,14 @@ class LatencyBenchmark(OllamaBenchmarkBase):
         self._log("Warmup complete.\n")
 
     async def run_request(self, i: int) -> dict:
-        """Run one streaming request, capturing wall time, TTFT, and tok/s."""
+        """Run one streaming request, capturing wall time, TTFT, tok/s, and
+        thinking/content token counts (reasoning models stream both)."""
         output_tokens = 0
         eval_duration_ns = 0
         ttft = None
         token_index = 0
+        thinking_tokens = 0
+        content_tokens = 0
 
         start = time.perf_counter()
         async for chunk in await self.client.chat(
@@ -264,12 +233,13 @@ class LatencyBenchmark(OllamaBenchmarkBase):
             stream=True,
             options={"temperature": 0.0},
         ):
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                token_index += 1
-                self._log(f"[R{i},T{token_index}]: {content.strip()}", end=" | ", flush=True)
+            token_index, got_thinking, got_content = self._stream_tokens(chunk, i, token_index, self._log)
+            if got_thinking:
+                thinking_tokens += 1
+            if got_content:
+                content_tokens += 1
 
-            if ttft is None and content:
+            if ttft is None and (got_thinking or got_content):
                 ttft = time.perf_counter() - start
 
             if chunk.get("done"):
@@ -284,6 +254,8 @@ class LatencyBenchmark(OllamaBenchmarkBase):
             "ttft_sec": ttft if ttft is not None else wall_time,
             "tokens_per_sec": tps,
             "output_tokens": output_tokens,
+            "thinking_tokens": thinking_tokens,
+            "content_tokens": content_tokens,
         }
 
     async def run_batch(self, n: int) -> dict:
@@ -300,6 +272,8 @@ class LatencyBenchmark(OllamaBenchmarkBase):
             "ttft_sec": statistics.mean(r["ttft_sec"] for r in results),
             "tokens_per_sec": statistics.mean(r["tokens_per_sec"] for r in results),
             "batch_tokens_per_sec": total_tokens / batch_time,
+            "thinking_tokens": statistics.mean(r["thinking_tokens"] for r in results),
+            "content_tokens": statistics.mean(r["content_tokens"] for r in results),
         }
 
     async def run_sweep(self) -> list:
@@ -312,12 +286,16 @@ class LatencyBenchmark(OllamaBenchmarkBase):
                 "ttft_sec": statistics.mean(r["ttft_sec"] for r in repeats),
                 "tokens_per_sec": statistics.mean(r["tokens_per_sec"] for r in repeats),
                 "batch_tokens_per_sec": statistics.mean(r["batch_tokens_per_sec"] for r in repeats),
+                "thinking_tokens": statistics.mean(r["thinking_tokens"] for r in repeats),
+                "content_tokens": statistics.mean(r["content_tokens"] for r in repeats),
             }
             summary.append(avg)
             self._log(f"N={n:2d}  wall={avg['wall_time_sec']:.2f}s  "
                        f"ttft={avg['ttft_sec']:.2f}s  "
                        f"tok/s/req={avg['tokens_per_sec']:.1f}  "
-                       f"batch tok/s={avg['batch_tokens_per_sec']:.1f}")
+                       f"batch tok/s={avg['batch_tokens_per_sec']:.1f}  "
+                       f"thinking_tok={avg['thinking_tokens']:.1f}  "
+                       f"content_tok={avg['content_tokens']:.1f}")
         return summary
 
     async def run_all(self) -> list:
@@ -357,21 +335,32 @@ class LatencyBenchmark(OllamaBenchmarkBase):
 
 # ── Example usage ──────────────────────────────────────────────────────────
 async def _main():
+    # VRAM benchmark: full grid search over n x num_ctx x pad_words.
+    # NOTE: total measurements = len(n_list) * len(ctx_list) * len(pad_list),
+    # each doing a full model unload + generation — keep lists small for a
+    # quick smoke test, then widen them for the real run.
     vram_bench = VRAMBenchmark(
         host="http://localhost:11441",
         model="mistral-small3.2:24b-32k",
         output_dir="./results/vram",
         verbose=True,
+        n_list=[1, 2, 4, 5, 10, 15, 20],
+        ctx_list=[8192, 16384, 32768, 65536],
+        pad_list=[0, 2000, 6000, 12000],
     )
-    vram_rows = await vram_bench.run_all()
+    vram_rows = await vram_bench.run_grid_search()
     vram_bench.save_results(vram_rows)
     vram_bench.plot_results(vram_rows)
 
+    # Latency benchmark: concurrency sweep, with thinking+content token tracking
+    # for reasoning models (e.g. anything that streams msg["thinking"]).
     latency_bench = LatencyBenchmark(
         host="http://localhost:11436",
         model="mistral-small3.2:24b-32k",
         output_dir="./results/latency",
         verbose=True,
+        n_list=[1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20],
+        m=2,
     )
     latency_summary = await latency_bench.run_all()
     latency_bench.save_results(latency_summary)
