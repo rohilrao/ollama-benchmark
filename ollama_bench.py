@@ -199,11 +199,35 @@ class VRAMBenchmark(OllamaBenchmarkBase):
 
     async def ollama_vram_mb(self) -> float:
         """VRAM (MB) Ollama reports for self.model via `ollama ps`; 0 if not loaded."""
+        breakdown = await self.ollama_memory_breakdown()
+        return breakdown["vram_mb"]
+
+    async def ollama_memory_breakdown(self) -> dict:
+        """
+        Reads `ollama ps` and reports not just VRAM used, but how it splits against
+        the model's total memory footprint — i.e. whether the model is fully on GPU
+        or partially offloaded to CPU (the same `size` vs `size_vram` fields the
+        `ollama ps` CLI uses to print "100% GPU" / "43%/57% CPU/GPU").
+
+        Returns a dict: {vram_mb, total_mb, gpu_pct, cpu_pct, fully_on_gpu}.
+        If the model isn't currently loaded, all fields are 0/None as appropriate.
+        """
         resp = await self.client.ps()
         for m in resp.models:
             if m.model == self.model:
-                return m.size_vram / (1024 ** 2)
-        return 0.0
+                size_vram = getattr(m, "size_vram", 0) or 0
+                size_total = getattr(m, "size", 0) or 0
+                vram_mb = size_vram / (1024 ** 2)
+                total_mb = size_total / (1024 ** 2)
+                if size_total > 0:
+                    gpu_pct = round(100 * size_vram / size_total, 1)
+                    cpu_pct = round(100 - gpu_pct, 1)
+                    fully_on_gpu = gpu_pct >= 99.95  # allow tiny rounding slack
+                else:
+                    gpu_pct = cpu_pct = fully_on_gpu = None
+                return {"vram_mb": vram_mb, "total_mb": total_mb, "gpu_pct": gpu_pct,
+                        "cpu_pct": cpu_pct, "fully_on_gpu": fully_on_gpu}
+        return {"vram_mb": 0.0, "total_mb": 0.0, "gpu_pct": None, "cpu_pct": None, "fully_on_gpu": None}
 
     async def unload_model(self):
         await self.client.chat(model=self.model, messages=[], keep_alive=0)
@@ -225,8 +249,9 @@ class VRAMBenchmark(OllamaBenchmarkBase):
 
     async def measure_batch(self, n: int, num_ctx: int = None, pad_words: int = 0) -> dict:
         """
-        Returns a dict: {"status", "error_message", "vram_mb", "elapsed_time_sec",
-        and optionally "ps_before"/"ps_after" on failure}. Never raises.
+        Returns a dict: {"status", "error_message", "elapsed_time_sec", "vram_mb",
+        "total_mb", "gpu_pct", "cpu_pct", "fully_on_gpu", and optionally
+        "ps_before"/"ps_after" on failure}. Never raises.
         """
         batch_start = time.perf_counter()
 
@@ -260,14 +285,18 @@ class VRAMBenchmark(OllamaBenchmarkBase):
             return row
 
         try:
-            vram = await asyncio.wait_for(self.ollama_vram_mb(), timeout=30)
-            return {"status": "ok", "error_message": None, "vram_mb": vram, "elapsed_time_sec": elapsed}
+            breakdown = await asyncio.wait_for(self.ollama_memory_breakdown(), timeout=30)
+            if breakdown["fully_on_gpu"] is False:
+                self._log(f"  ⚠ Partial CPU offload detected: gpu={breakdown['gpu_pct']}% "
+                           f"cpu={breakdown['cpu_pct']}% (n={n} num_ctx={num_ctx} pad_words={pad_words})")
+            return {"status": "ok", "error_message": None, "elapsed_time_sec": elapsed, **breakdown}
         except Exception as e:
             status, err_msg = self._classify_error(e)
             self._log(f"  ✗ VRAM read failed n={n} num_ctx={num_ctx} pad_words={pad_words}: "
                        f"{status} — {err_msg}")
             return {"status": "ps_read_error", "error_message": err_msg,
-                    "vram_mb": None, "elapsed_time_sec": elapsed}
+                    "vram_mb": None, "total_mb": None, "gpu_pct": None, "cpu_pct": None,
+                    "fully_on_gpu": None, "elapsed_time_sec": elapsed}
 
     async def run_grid_search(self) -> list:
         """
