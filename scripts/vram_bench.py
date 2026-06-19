@@ -16,11 +16,11 @@ import matplotlib.pyplot as plt
 import ollama
 
 # ── Configuration ────────────────────────────────────────────────────────
-HOST = "http://localhost:11440"
-MODEL = "mistral-small3.2:24b"
+HOST = "http://localhost:11441"
+MODEL = "mistral-small3.2:24b-32k"
 
-N_LIST = [1, 2, 4, 5]
-CTX_LIST = [8192, 16384, 32768]
+N_LIST = [1, 2, 4, 5, 10, 15, 20]
+CTX_LIST = [8192, 16384, 32768, 32768*2]
 PAD_LIST = [0, 2000, 6000, 12000]
 
 PROMPT_BASE = "Write a sentence with each letter of the english alphabet used EXACTLY once:"
