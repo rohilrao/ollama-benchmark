@@ -21,8 +21,8 @@ import ollama
 
 # ── Configuration ────────────────────────────────────────────────────────
 HOST   = "http://localhost:11436"
-MODEL  = "mistral-small3.2:24b"
-N_LIST = [1, 2, 4, 6, 8, 10]   # concurrency levels to sweep
+MODEL  = "mistral-small3.2:24b-32k"
+N_LIST = [1, 2, 4, 6, 8, 10,12,14,16,18,20]   # concurrency levels to sweep
 M      = 2                     # repeats per N, averaged for stability
 PROMPT_BASE = "Write a sentence with each letter of the english alphabet used EXACTLY once:"
 
