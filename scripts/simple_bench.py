@@ -1,7 +1,7 @@
 """
 Benchmark N concurrent Ollama chat requests: latency/throughput + memory.
 
-Edit CONFIG, then run: python benchmark.py
+Edit the CONFIG section, then run: python benchmark.py 
 """
 
 import asyncio
