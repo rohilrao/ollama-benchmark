@@ -12,18 +12,27 @@ For now, we rely on a script to do start containers. We should migrate this to a
 * Model data is persistently stored on the host at `/ollama_storage`, which is then mounted to `/root/.ollama` inside the container. (See: [Ollama Built Models](#ollama-built-models))
 
 ## Command-Line Options
-
+ 
 Execute the script using the format: `./start_ollama_container.sh [OPTIONS]`.
-
+ 
 | Option | Description | Default Value |
 | :--- | :--- | :--- |
 | `--num-parallel <n>` | Sets the `OLLAMA_NUM_PARALLEL` variable to handle concurrent requests. | 4 |
 | `--max-loaded-models <n>` | Sets the `OLLAMA_MAX_LOADED_MODELS` variable. | 3 |
+| `--keep-alive <duration>` | Sets the `OLLAMA_KEEP_ALIVE` variable — how long a loaded model stays in VRAM after its last request before being unloaded. Accepts a plain number of seconds (e.g. `300`), a duration string (`30s`, `5m`, `1h`), or `-1` to keep models loaded indefinitely. | `5m` |
+| `--max-queue <n>` | Sets the `OLLAMA_MAX_QUEUE` variable — the maximum number of requests that can queue before Ollama returns a `503` instead of accepting more. | 512 |
+| `--context-length <n>` | Sets the `OLLAMA_CONTEXT_LENGTH` variable — the default context window used for models that don't explicitly set `num_ctx` in their `Modelfile`. | 4096 |
 | `--api-port <port>` | Defines the host port mapped to the container's standard 11434 API port. | 11450 |
 | `--web-port <port>` | Defines the host port mapped to the container's 8080 port for a web UI. | 3004 |
 | `--enable-web-port <bool>` | Determines whether the web port is published. | false |
 | `--force-recreate` | Removes and recreates models, overriding any existing ones. | false |
 | `-h`, `--help` | Shows the help message and exits the script. | N/A |
+ 
+> **Note:** Every parameter above has a built-in default defined near the top of the script, under the `Defaults` section. You can change behavior in one of two ways:
+> 1. **Edit the defaults directly in the script** — useful for a permanent change that should apply every time the script is run without extra flags.
+> 2. **Override per-run via the corresponding CLI flag** — useful for one-off or environment-specific deployments without touching the script itself.
+>
+> CLI flags always take precedence over the script's built-in defaults for that invocation.
 
 ---
 
@@ -93,4 +102,28 @@ bash ./start_ollama_container.sh --force-recreate
 
 ---
 
+## Container-side path mapping
+
+The host directory `/ollama_models` is bind-mounted **read-only** into the container at `/root/models` (`-v "${SRC_DIR}:/root/models:ro"`). This means every `Modelfile` referenced during model creation is actually read from inside the container at:
+
+```
+/root/models/<model_folder_name>/Modelfile
+```
+
+For example, the `Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M` folder on the host becomes:
+
+```
+/root/models/Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M/Modelfile
+```
+
+This is the exact path the script passes to `ollama create -f <path>` when building each model. If you ever need to debug model creation manually by shelling into the container (`podman exec -it <container_name> bash`), use this `/root/models/...` path, not the host path `/ollama_models/...` — the host path doesn't exist inside the container.
+
+The host's persistent storage directory `/ollama_storage` is mounted the same way, but **read-write** and at a different container path: `/root/.ollama` (`-v "${OLLAMA_STORAGE_BIND}:/root/.ollama"`). This is where Ollama keeps the manifests and blobs for every model it builds. So when debugging inside the container, the two relevant mappings are:
+
+| Host path | Container path | Mode |
+| :--- | :--- | :--- |
+| `/ollama_models` | `/root/models` | read-only |
+| `/ollama_storage` | `/root/.ollama` | read-write |
+
+Knowing both mappings is useful if you ever need to manually inspect built models (e.g. `ls /root/.ollama/models/manifests` inside the container) or confirm that a model's source files are visible where the script expects them.
 
