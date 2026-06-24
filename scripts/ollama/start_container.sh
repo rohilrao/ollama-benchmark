@@ -32,12 +32,12 @@ FORCE_RECREATE_MODELS=false
 # ==========================================
 # Configuration Variables
 # ==========================================
-
-SRC_DIR="/ollama_models"
+BASE_DIR="/models/ollama/"
+SRC_DIR="${BASE_DIR}/ollama_models"
 API_WAIT_TIME=5 #script waits 5 seconds after starting the container to give Ollama container time to initialize 
 OLLAMA_READY_TIMEOUT=60
 OLLAMA_CONTAINER_IMAGE="docker.io/ollama/ollama:0.18.3"
-OLLAMA_STORAGE_BIND="/ollama_storage" # Persistent location to store ollama models (created from Modelfiles and GGUF files) -> will be mounted to /root/.ollama in the container
+OLLAMA_STORAGE_BIND="${BASE_DIR}/ollama_storage" # Persistent location to store ollama models (created from Modelfiles and GGUF files) -> will be mounted to /root/.ollama in the container
 
 # ==========================================
 # Helper Functions (defined early; needed by arg parsing)
