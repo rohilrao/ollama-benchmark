@@ -21,9 +21,9 @@ Execute the script using the format: `./start_ollama_container.sh [OPTIONS]`.
 | `--max-loaded-models <n>` | Sets the `OLLAMA_MAX_LOADED_MODELS` variable. | 3 |
 | `--keep-alive <duration>` | Sets the `OLLAMA_KEEP_ALIVE` variable — how long a loaded model stays in VRAM after its last request before being unloaded. Accepts a plain number of seconds (e.g. `300`), a duration string (`30s`, `5m`, `1h`), or `-1` to keep models loaded indefinitely. | `5m` |
 | `--max-queue <n>` | Sets the `OLLAMA_MAX_QUEUE` variable — the maximum number of requests that can queue before Ollama returns a `503` instead of accepting more. | 512 |
-| `--context-length <n>` | Sets the `OLLAMA_CONTEXT_LENGTH` variable — the default context window used for models that don't explicitly set `num_ctx` in their `Modelfile`. | 4096 |
-| `--api-port <port>` | Defines the host port mapped to the container's standard 11434 API port. | 11450 |
-| `--web-port <port>` | Defines the host port mapped to the container's 8080 port for a web UI. | 3004 |
+| `--context-length <n>` | Sets the `OLLAMA_CONTEXT_LENGTH` variable — the default context window used for models that don't explicitly set `num_ctx` in their `Modelfile`. | 32768 |
+| `--api-port <port>` | Defines the host port mapped to the container's standard 11434 API port. | 11434 |
+| `--web-port <port>` | Defines the host port mapped to the container's 8080 port for a web UI. | 3000 |
 | `--enable-web-port <bool>` | Determines whether the web port is published. | false |
 | `--force-recreate` | Removes and recreates models, overriding any existing ones. | false |
 | `-h`, `--help` | Shows the help message and exits the script. | N/A |
@@ -34,6 +34,29 @@ Execute the script using the format: `./start_ollama_container.sh [OPTIONS]`.
 >
 > CLI flags always take precedence over the script's built-in defaults for that invocation.
 
+
+## Server defaults vs. per-request overrides
+ 
+The parameters set by this script act as **defaults** that in some cases (mentioned below) can be overridden by individual client API calls on a per-request basis.
+ 
+* `OLLAMA_KEEP_ALIVE` can be overridden per-request via client code (`keep_alive=0`, `keep_alive=-1`, `keep_alive="10m"`, etc.); The `--keep-alive` value set by this script applies only to requests that don't specify their own `keep_alive`. There is no server-side ceiling, so any caller can override it per-request, including `keep_alive=-1` to pin a model in VRAM indefinitely. Client code SHOULD ABSOLUTELY avoid `keep_alive=-1` unless there's a deliberate reason a model needs to stay resident.
+* `OLLAMA_CONTEXT_LENGTH` can also be overridden per-request (`options={"num_ctx": <n>}`), but only up to the model's actual maximum context length — a model's architecture and quantization define a hard ceiling, so requesting a larger `num_ctx` than the model supports won't work regardless of the server default.
+* `OLLAMA_NUM_PARALLEL`, `OLLAMA_MAX_LOADED_MODELS`, and `OLLAMA_MAX_QUEUE` are fixed at container start, and CANNOT be overriden per-request.
+ 
+Example of a per-request override in Python:
+ 
+````python
+import ollama
+ 
+response = ollama.chat(
+    model="qwen3:32b-q8",
+    messages=[{"role": "user", "content": "Explain KV cache in 2 sentences."}],
+    keep_alive=0,                # overrides OLLAMA_KEEP_ALIVE for this call only
+    options={"num_ctx": 8192},   # overrides OLLAMA_CONTEXT_LENGTH for this call only
+)
+print(response["message"]["content"])
+````
+ 
 ---
 
 ## Ollama model files and storage
