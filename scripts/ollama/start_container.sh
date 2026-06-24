@@ -15,8 +15,6 @@ set -e # stop on first error
 #   --max-queue <n>             OLLAMA_MAX_QUEUE (default: 512) - max number of requests that can queue before Ollama returns a 503
 #   --context-length <n>        OLLAMA_CONTEXT_LENGTH (default: 32768) - default context window for models that don't explicitly set num_ctx in their Modelfile
 #   --api-port <port>           Host port for the Ollama API (default: 11434) - raises an error if api port is already in use
-#   --web-port <port>           Web ports are disable by default but could be enabled for a web UI like OllamaWebUI (default: 3000) - raises an error if web port is already in use
-#   --enable-web-port <bool>    Whether to publish the web port: true|false (default: false)
 #   --force-recreate            Remove and recreate any model that already exists (Required in case you updated the Modelfile or changed the GGUF)
 #   -h, --help                  Show this help message and exit
 #
@@ -34,8 +32,6 @@ OLLAMA_KEEP_ALIVE="5m"
 OLLAMA_MAX_QUEUE=512
 OLLAMA_CONTEXT_LENGTH=32768
 HOST_API_PORT=11434
-HOST_WEB_PORT=3000
-ENABLE_WEB_PORT=false
 FORCE_RECREATE_MODELS=false
 
 # ==========================================
@@ -62,10 +58,8 @@ Options:
   --max-loaded-models <n>     OLLAMA_MAX_LOADED_MODELS (default: 3)
   --keep-alive <duration>     OLLAMA_KEEP_ALIVE (default: 5m) - how long a loaded model stays in VRAM after its last request. Accepts a duration like "5m", "30s", "1h", a plain number of seconds, or "-1" to keep models loaded indefinitely.
   --max-queue <n>              OLLAMA_MAX_QUEUE (default: 512) - max number of requests that can queue before Ollama returns a 503
-  --context-length <n>         OLLAMA_CONTEXT_LENGTH (default: 4096) - default context window for models that don't explicitly set num_ctx in their Modelfile
+  --context-length <n>         OLLAMA_CONTEXT_LENGTH (default: 32768) - default context window for models that don't explicitly set num_ctx in their Modelfile
   --api-port <port>           Host port for the Ollama API (default: 11434 or whatever is specifed in the script) - raises an error if api port is already in use
-  --web-port <port>           Host port for the web UI (default: 3004) - raises an error if web port is already in use
-  --enable-web-port <bool>    Whether to publish the web port: true|false (default: false)
   --force-recreate            Remove and recreate any model that already exists (Required in case you updated the Modelfile or changed the GGUF)
   -h, --help                  Show this help message and exit
 
@@ -76,11 +70,7 @@ EOF
 }
 
 is_positive_int() {
-    [[ "$1" =~ ^[0-9]+$ ]]
-}
-
-is_bool() {
-    [ "$1" = "true" ] || [ "$1" = "false" ]
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
 is_valid_keep_alive() {
@@ -136,16 +126,6 @@ while [ $# -gt 0 ]; do
             HOST_API_PORT="$2"
             shift 2
             ;;
-        --web-port)
-            require_value "$1" "$2"
-            HOST_WEB_PORT="$2"
-            shift 2
-            ;;
-        --enable-web-port)
-            require_value "$1" "$2"
-            ENABLE_WEB_PORT="$2"
-            shift 2
-            ;;
         --force-recreate)
             FORCE_RECREATE_MODELS=true
             shift
@@ -188,14 +168,6 @@ if ! is_positive_int "$OLLAMA_CONTEXT_LENGTH"; then
 fi
 if ! is_positive_int "$HOST_API_PORT"; then
     echo "ERROR: --api-port must be a positive integer" >&2
-    exit 1
-fi
-if ! is_positive_int "$HOST_WEB_PORT"; then
-    echo "ERROR: --web-port must be a positive integer" >&2
-    exit 1
-fi
-if ! is_bool "$ENABLE_WEB_PORT"; then
-    echo "ERROR: --enable-web-port must be 'true' or 'false'" >&2
     exit 1
 fi
 
@@ -300,10 +272,6 @@ else
         echo "ERROR: HOST_API_PORT ${HOST_API_PORT} is already in use."
         exit 1
     fi
-    if [ "$ENABLE_WEB_PORT" = true ] && port_in_use "$HOST_WEB_PORT"; then
-        echo "ERROR: HOST_WEB_PORT ${HOST_WEB_PORT} is already in use."
-        exit 1
-    fi
 fi
 
 if container_running || container_exists; then
@@ -317,13 +285,8 @@ fi
 echo ""
 echo "Starting Ollama container: ${CONTAINER_NAME}"
 
-PORT_ARGS=(-p "${HOST_API_PORT}:11434")
-if [ "$ENABLE_WEB_PORT" = true ]; then
-    PORT_ARGS+=(-p "${HOST_WEB_PORT}:8080")
-fi
-
 podman run -d \
-    "${PORT_ARGS[@]}" \
+    -p "${HOST_API_PORT}:11434" \
     -e OLLAMA_HOST=0.0.0.0 \
     -e OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL}" \
     -e OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS}" \
