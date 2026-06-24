@@ -4,23 +4,27 @@ This document outlines the usage, configuration, and key operational insights fo
 
 For now, we rely on a script to do start containers. We should migrate this to a compose file that starts along with the alisa backend.
 
+
 ## Overview
+* The `start_ollama_container.sh` script automates the deployment of an Ollama container (currently: `docker.io/ollama/ollama:0.18.3`) using Podman. 
+* The container is configured to request all available NVIDIA GPUs using the `--device nvidia.com/gpu=all` flag. Ollama will dynamically use all available gpu memory to handle concurrent requests.
+* Container names are automatically generated based on the current configuration parameters, using the exact format: `ollama_np<NUM_PARALLEL>_mlm<MAX_LOADED_MODELS>_api<API_PORT>`.
+* The script scans the host directory `/ollama_models` for subdirectories containing a `Modelfile` to automatically build models within the container. (Read [Ollama model files and storage](#ollama-model-files-and-storage))
+* Model data is persistently stored on the host at `/ollama_storage`, which is then mounted to `/root/.ollama` inside the container.
 
-The script automates the deployment of an Ollama container (`docker.io/ollama/ollama:0.18.3`) using Podman. 
+## Command-Line Options
 
-It handles container lifecycle management, resource allocation, port validation, and automated model creation from local source files.
+Execute the script using the format: `bash ./start_ollama_container.sh [OPTIONS]`.
 
----
-
-## GPU Resource handling
-* The container is configured to request all available NVIDIA GPUs using the `--device nvidia.com/gpu=all` flag.
-* In case of concurrent requests, models will be loaded across all available GPUs
-
-* **Podman Over Docker:** The script exclusively relies on `podman` commands for container execution and management; it will fail if Podman is not installed.
-* **Hardware Acceleration:** The container is configured to request all available NVIDIA GPUs using the `--device nvidia.com/gpu=all` flag.
-* **Dynamic Container Naming:** Container names are automatically generated based on the current configuration parameters, using the exact format: `ollama_np<NUM_PARALLEL>_mlm<MAX_LOADED_MODELS>_api<API_PORT>`.
-* **Automated Model Provisioning:** The script scans the host directory `/ollama_models` for subdirectories containing a `Modelfile` to automatically build models within the container.
-* **Persistent Storage:** Model data is persistently stored on the host at `/ollama_storage`, which is then mounted to `/root/.ollama` inside the container.
+| Option | Description | Default Value |
+| :--- | :--- | :--- |
+| `--num-parallel <n>` | Sets the `OLLAMA_NUM_PARALLEL` variable to handle concurrent requests. | 4 |
+| `--max-loaded-models <n>` | Sets the `OLLAMA_MAX_LOADED_MODELS` variable. | 3 |
+| `--api-port <port>` | Defines the host port mapped to the container's standard 11434 API port. | 11450 |
+| `--web-port <port>` | Defines the host port mapped to the container's 8080 port for a web UI. | 3004 |
+| `--enable-web-port <bool>` | Determines whether the web port is published. | false |
+| `--force-recreate` | Removes and recreates models, overriding any existing ones. | false |
+| `-h`, `--help` | Shows the help message and exits the script. | N/A |
 
 ---
 
@@ -90,16 +94,4 @@ bash ./start_ollama_container.sh --force-recreate
 
 ---
 
-## Command-Line Options
 
-Execute the script using the format: `bash ./start_ollama_container.sh [OPTIONS]`.
-
-| Option | Description | Default Value |
-| :--- | :--- | :--- |
-| `--num-parallel <n>` | Sets the `OLLAMA_NUM_PARALLEL` variable to handle concurrent requests. | 4 |
-| `--max-loaded-models <n>` | Sets the `OLLAMA_MAX_LOADED_MODELS` variable. | 3 |
-| `--api-port <port>` | Defines the host port mapped to the container's standard 11434 API port. | 11450 |
-| `--web-port <port>` | Defines the host port mapped to the container's 8080 port for a web UI. | 3004 |
-| `--enable-web-port <bool>` | Determines whether the web port is published. | false |
-| `--force-recreate` | Removes and recreates models, overriding any existing ones. | false |
-| `-h`, `--help` | Shows the help message and exits the script. | N/A |
