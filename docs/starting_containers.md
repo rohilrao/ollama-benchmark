@@ -23,9 +23,7 @@ Execute the script using the format: `./start_ollama_container.sh [OPTIONS]`.
 | `--max-queue <n>` | Sets the `OLLAMA_MAX_QUEUE` variable — the maximum number of requests that can queue before Ollama returns a `503` instead of accepting more. | 512 |
 | `--context-length <n>` | Sets the `OLLAMA_CONTEXT_LENGTH` variable — the default context window used for models that don't explicitly set `num_ctx` in their `Modelfile`. | 32768 |
 | `--api-port <port>` | Defines the host port mapped to the container's standard 11434 API port. | 11434 |
-| `--web-port <port>` | Defines the host port mapped to the container's 8080 port for a web UI. | 3000 |
-| `--enable-web-port <bool>` | Determines whether the web port is published. | false |
-| `--force-recreate` | Removes and recreates models, overriding any existing ones. | false |
+| `--force-recreate` | A flag (no value). When passed, removes and recreates every model that already exists, overriding it with the current `Modelfile`/GGUF. When omitted, existing models are left as-is. | No value |
 | `-h`, `--help` | Shows the help message and exits the script. | N/A |
  
 > **Note:** Every parameter above has a built-in default defined near the top of the script, under the `Defaults` section. You can change behavior in one of two ways:
@@ -33,6 +31,8 @@ Execute the script using the format: `./start_ollama_container.sh [OPTIONS]`.
 > 2. **Override per-run via the corresponding CLI flag** — useful for one-off or environment-specific deployments without touching the script itself.
 >
 > CLI flags always take precedence over the script's built-in defaults for that invocation.
+>
+> **Note on `--force-recreate`:** unlike the other options, this is a bare flag, not a `--flag <value>` option. Its presence on the command line turns it on. To leave it disabled, simply omit it.
 
 
 ## Server defaults vs. per-request overrides
@@ -119,7 +119,7 @@ bash ./start_ollama_container.sh --force-recreate
 ## Important Notes
 
 * **Mandatory `model_tag.txt`:** The script will strictly skip model creation for any directory that contains a `Modelfile`,`gguf` file but lacks a `model_tag.txt` file.
-* **Port Conflicts Prevent Execution:** The script utilizes the `ss` command during pre-flight checks to verify if the requested API or Web ports are available; if they are already in use, it will raise an error and exit before attempting deployment.
+* **Port Conflicts Prevent Execution:** The script utilizes the `ss` command during pre-flight checks to verify if the requested API port is available; if it is already in use, it will raise an error and exit before attempting deployment.
 * **Updating Existing Models:** By default, the script skips model creation if a model already exists in the container. You must explicitly pass the `--force-recreate` flag if you have updated a `Modelfile` or a GGUF file and need those changes applied.
 * **Existing Containers Replaced:** If a container with the same name already exists, the script will automatically replace it using the `--replace` flag.
 
@@ -149,4 +149,3 @@ The host's persistent storage directory `/ollama_storage` is mounted the same wa
 | `/ollama_storage` | `/root/.ollama` | read-write |
 
 Knowing both mappings is useful if you ever need to manually inspect built models (e.g. `ls /root/.ollama/models/manifests` inside the container) or confirm that a model's source files are visible where the script expects them.
-
