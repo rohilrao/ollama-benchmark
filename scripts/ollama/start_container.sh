@@ -9,14 +9,20 @@ set -e # stop on first error
 #
 # Inspired from: https://docs.ollama.com/faq#how-does-ollama-handle-concurrent-requests
 # Options:
-#   --num-parallel <n>          OLLAMA_NUM_PARALLEL (default: 4) 
+#   --num-parallel <n>          OLLAMA_NUM_PARALLEL (default: 4)
 #   --max-loaded-models <n>     OLLAMA_MAX_LOADED_MODELS (default: 3)
+#   --keep-alive <duration>     OLLAMA_KEEP_ALIVE (default: 5m) - how long a loaded model stays in VRAM after its last request. Accepts a duration like "5m", "30s", "1h", a plain number of seconds, or "-1" to keep models loaded indefinitely.
+#   --max-queue <n>              OLLAMA_MAX_QUEUE (default: 512) - max number of requests that can queue before Ollama returns a 503
+#   --context-length <n>         OLLAMA_CONTEXT_LENGTH (default: 4096) - default context window for models that don't explicitly set num_ctx in their Modelfile
 #   --api-port <port>           Host port for the Ollama API (default: 11434) - raises an error if api port is already in use
 #   --web-port <port>           Web ports are disable by default but could be enabled for a web UI like OllamaWebUI (default: 3000) - raises an error if web port is already in use
 #   --enable-web-port <bool>    Whether to publish the web port: true|false (default: false)
 #   --force-recreate            Remove and recreate any model that already exists (Required in case you updated the Modelfile or changed the GGUF)
 #   -h, --help                  Show this help message and exit
 #
+# NOTE: Every parameter below has a built-in default defined in the "Defaults" section.
+#       You can either edit those defaults directly in the script for a permanent change,
+#       or override them per-run using the corresponding CLI flag without touching the script.
 #
 # ==========================================
 # Defaults
@@ -24,6 +30,9 @@ set -e # stop on first error
 
 OLLAMA_NUM_PARALLEL=4
 OLLAMA_MAX_LOADED_MODELS=3
+OLLAMA_KEEP_ALIVE="5m"
+OLLAMA_MAX_QUEUE=512
+OLLAMA_CONTEXT_LENGTH=4096
 HOST_API_PORT=11450
 HOST_WEB_PORT=3004
 ENABLE_WEB_PORT=false
@@ -32,6 +41,7 @@ FORCE_RECREATE_MODELS=false
 # ==========================================
 # Configuration Variables
 # ==========================================
+
 BASE_DIR="/models/ollama/"
 SRC_DIR="${BASE_DIR}/ollama_models"
 API_WAIT_TIME=5 #script waits 5 seconds after starting the container to give Ollama container time to initialize 
@@ -45,16 +55,23 @@ OLLAMA_STORAGE_BIND="${BASE_DIR}/ollama_storage" # Persistent location to store 
 
 print_usage() {
     cat <<'EOF'
-Usage: bash ./deploy_ollama.sh [OPTIONS]
+Usage: bash ./start_ollama_container.sh [OPTIONS]
 
 Options:
   --num-parallel <n>          OLLAMA_NUM_PARALLEL (default: 4)
   --max-loaded-models <n>     OLLAMA_MAX_LOADED_MODELS (default: 3)
+  --keep-alive <duration>     OLLAMA_KEEP_ALIVE (default: 5m) - how long a loaded model stays in VRAM after its last request. Accepts a duration like "5m", "30s", "1h", a plain number of seconds, or "-1" to keep models loaded indefinitely.
+  --max-queue <n>              OLLAMA_MAX_QUEUE (default: 512) - max number of requests that can queue before Ollama returns a 503
+  --context-length <n>         OLLAMA_CONTEXT_LENGTH (default: 4096) - default context window for models that don't explicitly set num_ctx in their Modelfile
   --api-port <port>           Host port for the Ollama API (default: 11434 or whatever is specifed in the script) - raises an error if api port is already in use
   --web-port <port>           Host port for the web UI (default: 3004) - raises an error if web port is already in use
   --enable-web-port <bool>    Whether to publish the web port: true|false (default: false)
   --force-recreate            Remove and recreate any model that already exists (Required in case you updated the Modelfile or changed the GGUF)
   -h, --help                  Show this help message and exit
+
+NOTE: Every parameter above has a built-in default defined near the top of the script.
+      You can either edit those defaults directly in the script for a permanent change,
+      or override them per-run using the corresponding CLI flag without touching the script.
 EOF
 }
 
@@ -64,6 +81,12 @@ is_positive_int() {
 
 is_bool() {
     [ "$1" = "true" ] || [ "$1" = "false" ]
+}
+
+is_valid_keep_alive() {
+    # Accepts: -1 (keep loaded indefinitely), a plain number of seconds (e.g. 300),
+    # or a duration string like 30s, 5m, 1h
+    [[ "$1" =~ ^-1$ ]] || [[ "$1" =~ ^[0-9]+(s|m|h)?$ ]]
 }
 
 require_value() {
@@ -91,6 +114,21 @@ while [ $# -gt 0 ]; do
         --max-loaded-models)
             require_value "$1" "$2"
             OLLAMA_MAX_LOADED_MODELS="$2"
+            shift 2
+            ;;
+        --keep-alive)
+            require_value "$1" "$2"
+            OLLAMA_KEEP_ALIVE="$2"
+            shift 2
+            ;;
+        --max-queue)
+            require_value "$1" "$2"
+            OLLAMA_MAX_QUEUE="$2"
+            shift 2
+            ;;
+        --context-length)
+            require_value "$1" "$2"
+            OLLAMA_CONTEXT_LENGTH="$2"
             shift 2
             ;;
         --api-port)
@@ -134,6 +172,18 @@ if ! is_positive_int "$OLLAMA_NUM_PARALLEL"; then
 fi
 if ! is_positive_int "$OLLAMA_MAX_LOADED_MODELS"; then
     echo "ERROR: --max-loaded-models must be a positive integer" >&2
+    exit 1
+fi
+if ! is_valid_keep_alive "$OLLAMA_KEEP_ALIVE"; then
+    echo "ERROR: --keep-alive must be -1, a plain number of seconds, or a duration like 30s/5m/1h" >&2
+    exit 1
+fi
+if ! is_positive_int "$OLLAMA_MAX_QUEUE"; then
+    echo "ERROR: --max-queue must be a positive integer" >&2
+    exit 1
+fi
+if ! is_positive_int "$OLLAMA_CONTEXT_LENGTH"; then
+    echo "ERROR: --context-length must be a positive integer" >&2
     exit 1
 fi
 if ! is_positive_int "$HOST_API_PORT"; then
@@ -277,6 +327,9 @@ podman run -d \
     -e OLLAMA_HOST=0.0.0.0 \
     -e OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL}" \
     -e OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS}" \
+    -e OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE}" \
+    -e OLLAMA_MAX_QUEUE="${OLLAMA_MAX_QUEUE}" \
+    -e OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}" \
     -v "${SRC_DIR}:/root/models:ro" \
     -v "${OLLAMA_STORAGE_BIND}:/root/.ollama" \
     --device nvidia.com/gpu=all \
