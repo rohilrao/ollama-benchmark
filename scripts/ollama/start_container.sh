@@ -12,8 +12,8 @@ set -e # stop on first error
 #   --num-parallel <n>          OLLAMA_NUM_PARALLEL (default: 4)
 #   --max-loaded-models <n>     OLLAMA_MAX_LOADED_MODELS (default: 3)
 #   --keep-alive <duration>     OLLAMA_KEEP_ALIVE (default: 5m) - how long a loaded model stays in VRAM after its last request. Accepts a duration like "5m", "30s", "1h", a plain number of seconds, or "-1" to keep models loaded indefinitely.
-#   --max-queue <n>              OLLAMA_MAX_QUEUE (default: 512) - max number of requests that can queue before Ollama returns a 503
-#   --context-length <n>         OLLAMA_CONTEXT_LENGTH (default: 4096) - default context window for models that don't explicitly set num_ctx in their Modelfile
+#   --max-queue <n>             OLLAMA_MAX_QUEUE (default: 512) - max number of requests that can queue before Ollama returns a 503
+#   --context-length <n>        OLLAMA_CONTEXT_LENGTH (default: 32768) - default context window for models that don't explicitly set num_ctx in their Modelfile
 #   --api-port <port>           Host port for the Ollama API (default: 11434) - raises an error if api port is already in use
 #   --web-port <port>           Web ports are disable by default but could be enabled for a web UI like OllamaWebUI (default: 3000) - raises an error if web port is already in use
 #   --enable-web-port <bool>    Whether to publish the web port: true|false (default: false)
@@ -32,9 +32,9 @@ OLLAMA_NUM_PARALLEL=4
 OLLAMA_MAX_LOADED_MODELS=3
 OLLAMA_KEEP_ALIVE="5m"
 OLLAMA_MAX_QUEUE=512
-OLLAMA_CONTEXT_LENGTH=4096
-HOST_API_PORT=11450
-HOST_WEB_PORT=3004
+OLLAMA_CONTEXT_LENGTH=32768
+HOST_API_PORT=11434
+HOST_WEB_PORT=3000
 ENABLE_WEB_PORT=false
 FORCE_RECREATE_MODELS=false
 
