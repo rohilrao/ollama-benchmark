@@ -4,17 +4,16 @@ This document outlines the usage, configuration, and key operational insights fo
 
 For now, we rely on a script to do start containers. We should migrate this to a compose file that starts along with the alisa backend.
 
-
 ## Overview
 * The `start_ollama_container.sh` script automates the deployment of an Ollama container (currently: `docker.io/ollama/ollama:0.18.3`) using Podman. 
 * The container is configured to request all available NVIDIA GPUs using the `--device nvidia.com/gpu=all` flag. Ollama will dynamically use all available gpu memory to handle concurrent requests.
 * Container names are automatically generated based on the current configuration parameters, using the exact format: `ollama_np<NUM_PARALLEL>_mlm<MAX_LOADED_MODELS>_api<API_PORT>`.
-* The script scans the host directory `/ollama_models` for subdirectories containing a `Modelfile` to automatically build models within the container. (Read [Ollama model files and storage](#ollama-model-files-and-storage))
-* Model data is persistently stored on the host at `/ollama_storage`, which is then mounted to `/root/.ollama` inside the container.
+* The script scans the host directory `/ollama_models` for subdirectories containing a `Modelfile` to automatically build models within the container. (See: [Ollama model files and storage](#ollama-model-files-and-storage))
+* Model data is persistently stored on the host at `/ollama_storage`, which is then mounted to `/root/.ollama` inside the container. (See: [Ollama Built Models](#ollama-built-models))
 
 ## Command-Line Options
 
-Execute the script using the format: `bash ./start_ollama_container.sh [OPTIONS]`.
+Execute the script using the format: `./start_ollama_container.sh [OPTIONS]`.
 
 | Option | Description | Default Value |
 | :--- | :--- | :--- |
@@ -52,7 +51,7 @@ Execute the script using the format: `bash ./start_ollama_container.sh [OPTIONS]
    - Modelfile (model instructions - including system prompt, context length etc. - that can be overwritten at run time)
    - model_tag.txt (this is the name you use to actually call a model at runtime: for example: mistral-small3.2:24b)  
 
-* the model_tag.txt is required by our script to build the models
+* All the three file types are required mandatorily by our script for creating a model.
 
 NOTE: Please use the same naming convention whenever you add a new model.
 
@@ -63,10 +62,10 @@ Once you have downloaded the correct GGUF file and managed to obtain accurate `M
 For example, Ollama uses the following command to create a model: 
 ````ollama create <model-tag> -f <model_file_path>````
 
->model-tag is the name we use to actually refer to the model at inference time. It is also the name used by ollama when you run ollama list.
->the model-tag can be found in the corresponding model_tag.txt file
+>model-tag is the name we use to actually refer to the model at inference time. It is also the name used by ollama when you run a command like ```ollama list``` (inside the ollama container).
+>The model-tag can be found in the corresponding `model_tag.txt` file
 
-The resulting files that Ollama creates using the GGUF and Modelfile you provide are stored under: ```/models/ollama/ollama_storage```
+The resulting files that Ollama creates are stored under: ```/models/ollama/ollama_storage```
 
 * **Ollama's storage architecture** is heavily inspired by Docker containers. Instead of storing a model as one giant, monolithic file, it breaks it down into reusable layers. It creates the following types of data:
   * **Manifests:** A lightweight JSON blueprint that acts as the table of contents, linking a specific model name to its required data.
@@ -87,8 +86,8 @@ bash ./start_ollama_container.sh --force-recreate
 
 ## Important Notes
 
-* **Mandatory `model_tag.txt`:** The script will strictly skip model creation for any directory that contains a `Modelfile` but lacks a `model_tag.txt` file.
-* **Port Conflicts Prevent Execution:** The script utilizes the `ss` command during pre-flight checks to verify if the requested API or Web ports are available; if they are in use, it will raise an error and exit before attempting deployment.
+* **Mandatory `model_tag.txt`:** The script will strictly skip model creation for any directory that contains a `Modelfile`,`gguf` file but lacks a `model_tag.txt` file.
+* **Port Conflicts Prevent Execution:** The script utilizes the `ss` command during pre-flight checks to verify if the requested API or Web ports are available; if they are already in use, it will raise an error and exit before attempting deployment.
 * **Updating Existing Models:** By default, the script skips model creation if a model already exists in the container. You must explicitly pass the `--force-recreate` flag if you have updated a `Modelfile` or a GGUF file and need those changes applied.
 * **Existing Containers Replaced:** If a container with the same name already exists, the script will automatically replace it using the `--replace` flag.
 
