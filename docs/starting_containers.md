@@ -2,7 +2,7 @@
 
 This document outlines the usage, configuration, and key operational insights for the `start_ollama_container.sh` deployment script.
 
-For now, we rely on a script to do start containers. We should migrate this to a compose file that starts along with the alisa backend.
+For now, we rely on a script to start containers. This could eventually move to a Compose file.
 
 ## Overview
 * The `start_ollama_container.sh` script automates the deployment of an Ollama container (currently: `docker.io/ollama/ollama:0.18.3`) using Podman. 
