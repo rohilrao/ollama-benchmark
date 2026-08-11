@@ -190,12 +190,13 @@ def append_csv_row(model: str, num_ctx: int, run: int, result: dict, path: str =
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "status": "ok",
         "error_message": "",
-        **{k: result[k] for k in (
+        **{k: round(result[k], 2) for k in (
             "load_time_s", "total_time_s", "wall_time_s",
             "prompt_eval_time_s", "eval_time_s",
-            "prompt_tokens", "generated_tokens",
             "vram_gb", "total_size_gb", "vram_pct",
         )},
+        "prompt_tokens": result["prompt_tokens"],
+        "generated_tokens": result["generated_tokens"],
     }
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -224,10 +225,10 @@ def append_error_row(model: str, num_ctx: int, run: int, error_message: str, pat
 def print_summary(name: str, values: list[float]):
     print(
         f"{name:<22}"
-        f"mean={statistics.mean(values):8.3f}s  "
-        f"std={statistics.stdev(values) if len(values) > 1 else 0:7.3f}s  "
-        f"min={min(values):8.3f}s  "
-        f"max={max(values):8.3f}s"
+        f"mean={statistics.mean(values):8.2f}s  "
+        f"std={statistics.stdev(values) if len(values) > 1 else 0:7.2f}s  "
+        f"min={min(values):8.2f}s  "
+        f"max={max(values):8.2f}s"
     )
 
 
@@ -263,13 +264,13 @@ def benchmark_model_context(model: str, num_ctx: int) -> list[dict]:
 
         results.append(result)
         append_csv_row(model, num_ctx, run, result)
-        print(f"Load duration:       {result['load_time_s']:.3f} s")
-        print(f"Total duration:      {result['total_time_s']:.3f} s")
-        print(f"HTTP wall time:      {result['wall_time_s']:.3f} s")
-        print(f"Prompt eval:         {result['prompt_eval_time_s']:.3f} s")
-        print(f"Generation:          {result['eval_time_s']:.3f} s")
+        print(f"Load duration:       {result['load_time_s']:.2f} s")
+        print(f"Total duration:      {result['total_time_s']:.2f} s")
+        print(f"HTTP wall time:      {result['wall_time_s']:.2f} s")
+        print(f"Prompt eval:         {result['prompt_eval_time_s']:.2f} s")
+        print(f"Generation:          {result['eval_time_s']:.2f} s")
         print(f"VRAM used:           {result['vram_gb']:.2f} GB / "
-              f"{result['total_size_gb']:.2f} GB total ({result['vram_pct']:.1f}% on GPU)")
+              f"{result['total_size_gb']:.2f} GB total ({result['vram_pct']:.2f}% on GPU)")
     return results
 
 
