@@ -77,6 +77,7 @@ WARM_KEEP_ALIVE = "24h"            # Ollama duration string (or an int seconds v
 
 UNLOAD_TIMEOUT_S = 180             # generous: 3 large models to flush
 UNLOAD_POLL_INTERVAL_S = 1.0
+HEARTBEAT_INTERVAL_S = 15          # print a "still working" line at least this often
 
 REQUEST_RETRY_ATTEMPTS = 3
 REQUEST_RETRY_BACKOFF_S = 3        # linear backoff: wait = attempt * backoff
@@ -157,10 +158,16 @@ async def unload_all_and_verify(models: list[str],
             await unload_model(other)
 
     start = time.perf_counter()
+    last_heartbeat = start
     while time.perf_counter() - start < timeout:
         snap = await get_ps_snapshot()
         if not snap:
             return
+        now = time.perf_counter()
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+            print(f"    ... still unloading, {now - start:.0f}s elapsed, "
+                  f"still resident: {list(snap.keys())}")
+            last_heartbeat = now
         await asyncio.sleep(poll)
 
     raise TimeoutError(
@@ -172,9 +179,10 @@ async def warm_up_models(models: list[str], num_ctx: int, keep_alive: str):
     """Load every model once (concurrently) with a long keep_alive so it's
     resident and ready before the timed sweep starts. Used in warm mode."""
     print(f"\n  Warm-up: loading {len(models)} models "
-          f"(num_ctx={num_ctx}, keep_alive={keep_alive})...")
-    tasks = [with_retries_async(run_single_request, m, num_ctx, keep_alive) for m in models]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+          f"(num_ctx={num_ctx}, keep_alive={keep_alive})... "
+          f"(this can take a while on first load of a large model)")
+    tasks_spec = [(m, num_ctx, keep_alive) for m in models]
+    results = await run_tracked_batch(tasks_spec, label="warm-up")
     for m, r in zip(models, results):
         if isinstance(r, Exception):
             print(f"    [error] warm-up failed for {m}: {r}")
@@ -183,6 +191,53 @@ async def warm_up_models(models: list[str], num_ctx: int, keep_alive: str):
     snap = await get_ps_snapshot()
     total_gb = sum(v["vram_mb"] for v in snap.values()) / 1024
     print(f"  Combined VRAM after warm-up: {total_gb:.2f} GB")
+
+
+# ── Progress reporting helpers ───────────────────────────────────────────
+async def run_and_report(model: str, num_ctx: int, keep_alive, progress: dict) -> dict:
+    """Wraps run_single_request (with retries) and prints a line the moment
+    each individual request finishes, so output streams in during a batch
+    instead of going silent until everything is done."""
+    try:
+        result = await with_retries_async(run_single_request, model, num_ctx, keep_alive)
+        progress["done"] += 1
+        print(f"    [{progress['done']}/{progress['total']}] {model:<32} "
+              f"done in {result['wall_time_s']:.1f}s "
+              f"(ttft={result['ttft_s']:.1f}s, {result['tokens_per_sec']:.1f} tok/s)")
+        return result
+    except Exception as e:
+        progress["done"] += 1
+        print(f"    [{progress['done']}/{progress['total']}] {model:<32} FAILED: {e}")
+        raise
+
+
+async def heartbeat_ticker(progress: dict, batch_start: float, label: str):
+    """Runs alongside a batch and prints a 'still working' line periodically
+    so a long cold-load (e.g. a 235B model with no output yet) doesn't look
+    like the script has hung. Cancelled once the batch finishes."""
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+            elapsed = time.perf_counter() - batch_start
+            print(f"    ... {label}: {progress['done']}/{progress['total']} requests "
+                  f"finished, {elapsed:.0f}s elapsed")
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_tracked_batch(tasks_spec: list[tuple], label: str) -> list:
+    """tasks_spec: list of (model, num_ctx, keep_alive) tuples to run concurrently.
+    Prints progress as each finishes plus periodic heartbeats. Returns gather() results
+    (exceptions included, matching asyncio.gather(..., return_exceptions=True))."""
+    progress = {"done": 0, "total": len(tasks_spec)}
+    batch_start = time.perf_counter()
+    ticker = asyncio.create_task(heartbeat_ticker(progress, batch_start, label))
+    try:
+        tasks = [run_and_report(model, num_ctx, keep_alive, progress)
+                 for model, num_ctx, keep_alive in tasks_spec]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        ticker.cancel()
 
 
 # ── Single request ───────────────────────────────────────────────────────
@@ -250,9 +305,12 @@ def append_rows(path: str, rows: list[dict]):
 # ── One (context, N, run) round across all models ──────────────────────
 async def run_round(models: list[str], num_ctx: int, n: int, run_idx: int,
                      csv_path: str, warm: bool = False,
-                     keep_alive: str | None = None) -> dict:
+                     keep_alive: str | None = None,
+                     round_no: int = 0, total_rounds: int = 0) -> dict:
     mode_label = "warm" if warm else "cold"
-    print(f"\n=== [{mode_label}] ctx={num_ctx} | N={n}/model | run {run_idx}/{RUNS} ===")
+    progress_prefix = f"[Round {round_no}/{total_rounds}] " if total_rounds else ""
+    print(f"\n=== {progress_prefix}[{mode_label}] ctx={num_ctx} | N={n}/model | "
+          f"run {run_idx}/{RUNS} ===")
 
     if warm:
         # Models are expected to already be resident from warm_up_models()
@@ -263,13 +321,11 @@ async def run_round(models: list[str], num_ctx: int, n: int, run_idx: int,
         print("  Unloading all models & verifying clean state...")
         await unload_all_and_verify(models)
 
-    tasks = []
-    for model in models:
-        for _ in range(n):
-            tasks.append(with_retries_async(run_single_request, model, num_ctx, keep_alive))
-
+    total_requests = n * len(models)
+    print(f"  Firing {total_requests} requests ({n} per model x {len(models)} models)...")
+    tasks_spec = [(model, num_ctx, keep_alive) for model in models for _ in range(n)]
     batch_start = time.perf_counter()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await run_tracked_batch(tasks_spec, label=f"{mode_label} ctx={num_ctx} N={n}")
     batch_wall = time.perf_counter() - batch_start
 
     vram_snap = await get_ps_snapshot()
@@ -386,6 +442,8 @@ async def main():
     csv_path = init_csv()
     agg = {}  # agg[num_ctx][n][model] = averaged stats across RUNS
     warm = BENCHMARK_MODE == "warm"
+    total_rounds = len(CONTEXT_SIZES) * len(N_LIST) * RUNS
+    round_no = 0
 
     if warm:
         print(f"Running in WARM mode (keep_alive={WARM_KEEP_ALIVE}). "
@@ -393,6 +451,8 @@ async def main():
               "change triggers a reload.")
     else:
         print("Running in COLD mode. Every round unloads and reloads from scratch.")
+    print(f"Total timed rounds: {total_rounds} "
+          f"({len(CONTEXT_SIZES)} context sizes x {len(N_LIST)} N levels x {RUNS} runs)")
 
     for num_ctx in CONTEXT_SIZES:
         agg[num_ctx] = {}
@@ -404,8 +464,10 @@ async def main():
         for n in N_LIST:
             round_runs = []
             for run_idx in range(1, RUNS + 1):
+                round_no += 1
                 summary = await run_round(MODELS, num_ctx, n, run_idx, csv_path,
-                                           warm=warm, keep_alive=WARM_KEEP_ALIVE if warm else None)
+                                           warm=warm, keep_alive=WARM_KEEP_ALIVE if warm else None,
+                                           round_no=round_no, total_rounds=total_rounds)
                 round_runs.append(summary)
 
             # average the RUNS repeats for this (num_ctx, n)
