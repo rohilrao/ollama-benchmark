@@ -26,6 +26,16 @@ NOTE: Running 3 models concurrently means their VRAM footprints stack.
 Watch the "total_vram_all_models_gb" column -- if it's near/over your GPU's
 capacity, later requests may fail or partially offload to CPU, which is
 useful signal but will also show up as errors/rows with status=error.
+
+WARM MODE (BENCHMARK_MODE = "warm"):
+Instead of unloading before every round, each model is loaded once per
+context size with a long keep_alive (WARM_KEEP_ALIVE, default "24h"), and
+every request in the sweep also carries that keep_alive so the model never
+falls back to Ollama's short default and unloads mid-sweep. No unloading
+happens between N levels or RUNS repeats -- you're measuring steady-state
+latency/throughput/VRAM with the load cost already paid, which is the
+realistic picture for a server that keeps models hot. All models are still
+fully unloaded at the very end of the script regardless of mode.
 """
 
 import asyncio
@@ -51,6 +61,19 @@ MODELS = [
 CONTEXT_SIZES = [8192, 32768]      # num_ctx values to sweep
 N_LIST = [1, 3, 5]                 # concurrent requests PER MODEL, per round
 RUNS = 5                           # repeats of each (context, N) combo
+
+# "cold"  -> unload + verify-clean before every round, so every round pays
+#            a fresh load cost (measures cold load time).
+# "warm"  -> load each model ONCE per context size with a long keep_alive,
+#            then run all N/RUNS repeats against the already-resident models
+#            with no unload in between (measures steady-state warm latency/
+#            throughput/VRAM). All models are still unloaded at the very end.
+# NOTE: changing num_ctx always forces Ollama to reload a model (context
+# size is fixed at load time), so a reload naturally happens once per new
+# context size even in warm mode -- that's real Ollama behavior, not
+# something this script forces.
+BENCHMARK_MODE = "cold"
+WARM_KEEP_ALIVE = "24h"            # Ollama duration string (or an int seconds value)
 
 UNLOAD_TIMEOUT_S = 180             # generous: 3 large models to flush
 UNLOAD_POLL_INTERVAL_S = 1.0
@@ -145,8 +168,27 @@ async def unload_all_and_verify(models: list[str],
     )
 
 
+async def warm_up_models(models: list[str], num_ctx: int, keep_alive: str):
+    """Load every model once (concurrently) with a long keep_alive so it's
+    resident and ready before the timed sweep starts. Used in warm mode."""
+    print(f"\n  Warm-up: loading {len(models)} models "
+          f"(num_ctx={num_ctx}, keep_alive={keep_alive})...")
+    tasks = [with_retries_async(run_single_request, m, num_ctx, keep_alive) for m in models]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for m, r in zip(models, results):
+        if isinstance(r, Exception):
+            print(f"    [error] warm-up failed for {m}: {r}")
+        else:
+            print(f"    {m:<32} loaded in {r['load_time_s']:.2f}s")
+    snap = await get_ps_snapshot()
+    total_gb = sum(v["vram_mb"] for v in snap.values()) / 1024
+    print(f"  Combined VRAM after warm-up: {total_gb:.2f} GB")
+
+
 # ── Single request ───────────────────────────────────────────────────────
-async def run_single_request(model: str, num_ctx: int) -> dict:
+async def run_single_request(model: str, num_ctx: int, keep_alive=None) -> dict:
+    """keep_alive: pass a duration (e.g. "24h") to keep the model resident
+    after this request; omit for cold-mode requests to use Ollama's default."""
     output_tokens = 0
     eval_duration_ns = 0
     load_duration_ns = 0
@@ -154,13 +196,17 @@ async def run_single_request(model: str, num_ctx: int) -> dict:
     prompt_eval_duration_ns = 0
     ttft = None
 
-    start = time.perf_counter()
-    async for chunk in await client.chat(
+    chat_kwargs = dict(
         model=model,
         messages=[{"role": "user", "content": make_prompt()}],
         stream=True,
         options={"temperature": 0.0, "num_ctx": num_ctx},
-    ):
+    )
+    if keep_alive is not None:
+        chat_kwargs["keep_alive"] = keep_alive
+
+    start = time.perf_counter()
+    async for chunk in await client.chat(**chat_kwargs):
         content = chunk.get("message", {}).get("content")
         if content and ttft is None:
             ttft = time.perf_counter() - start
@@ -187,7 +233,8 @@ async def run_single_request(model: str, num_ctx: int) -> dict:
 
 # ── CSV I/O ──────────────────────────────────────────────────────────────
 def init_csv() -> str:
-    path = f"multi_model_benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    path = (f"multi_model_benchmark_{BENCHMARK_MODE}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     with open(path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
     return path
@@ -202,15 +249,24 @@ def append_rows(path: str, rows: list[dict]):
 
 # ── One (context, N, run) round across all models ──────────────────────
 async def run_round(models: list[str], num_ctx: int, n: int, run_idx: int,
-                     csv_path: str) -> dict:
-    print(f"\n=== ctx={num_ctx} | N={n}/model | run {run_idx}/{RUNS} ===")
-    print("  Unloading all models & verifying clean state...")
-    await unload_all_and_verify(models)
+                     csv_path: str, warm: bool = False,
+                     keep_alive: str | None = None) -> dict:
+    mode_label = "warm" if warm else "cold"
+    print(f"\n=== [{mode_label}] ctx={num_ctx} | N={n}/model | run {run_idx}/{RUNS} ===")
+
+    if warm:
+        # Models are expected to already be resident from warm_up_models()
+        # (or a previous round at this same context size) -- no unload here,
+        # that's the whole point of warm mode.
+        pass
+    else:
+        print("  Unloading all models & verifying clean state...")
+        await unload_all_and_verify(models)
 
     tasks = []
     for model in models:
         for _ in range(n):
-            tasks.append(with_retries_async(run_single_request, model, num_ctx))
+            tasks.append(with_retries_async(run_single_request, model, num_ctx, keep_alive))
 
     batch_start = time.perf_counter()
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -293,7 +349,7 @@ def plot_results(agg: dict, models: list[str]):
     for num_ctx, by_n in agg.items():
         n_vals = sorted(by_n.keys())
         fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-        fig.suptitle(f"Multi-model concurrent benchmark — num_ctx={num_ctx}")
+        fig.suptitle(f"Multi-model concurrent benchmark [{BENCHMARK_MODE}] — num_ctx={num_ctx}")
 
         metrics = [
             ("wall_time_s", "Wall time per request (s)", axes[0, 0]),
@@ -318,7 +374,7 @@ def plot_results(agg: dict, models: list[str]):
         axes[1, 1].legend(fontsize=8)
 
         fig.tight_layout()
-        out_path = f"multi_model_benchmark_ctx{num_ctx}.png"
+        out_path = f"multi_model_benchmark_{BENCHMARK_MODE}_ctx{num_ctx}.png"
         fig.savefig(out_path, dpi=150)
         print(f"Saved plot -> {out_path}")
 
@@ -329,13 +385,27 @@ async def main():
 
     csv_path = init_csv()
     agg = {}  # agg[num_ctx][n][model] = averaged stats across RUNS
+    warm = BENCHMARK_MODE == "warm"
+
+    if warm:
+        print(f"Running in WARM mode (keep_alive={WARM_KEEP_ALIVE}). "
+              "Models stay resident between rounds; only a context-size "
+              "change triggers a reload.")
+    else:
+        print("Running in COLD mode. Every round unloads and reloads from scratch.")
 
     for num_ctx in CONTEXT_SIZES:
         agg[num_ctx] = {}
+        if warm:
+            # Load once for this context size; subsequent rounds at the
+            # same num_ctx reuse the already-resident models.
+            await warm_up_models(MODELS, num_ctx, WARM_KEEP_ALIVE)
+
         for n in N_LIST:
             round_runs = []
             for run_idx in range(1, RUNS + 1):
-                summary = await run_round(MODELS, num_ctx, n, run_idx, csv_path)
+                summary = await run_round(MODELS, num_ctx, n, run_idx, csv_path,
+                                           warm=warm, keep_alive=WARM_KEEP_ALIVE if warm else None)
                 round_runs.append(summary)
 
             # average the RUNS repeats for this (num_ctx, n)
