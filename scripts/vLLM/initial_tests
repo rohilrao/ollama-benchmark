@@ -1,0 +1,12 @@
+podman run --rm -it \
+  --device nvidia.com/gpu=all \
+  --ipc=host \
+  -p 8555:8000 \
+  -v /projects/models/hf/DeepSeek-R1-0528-quantized.w4a16:/models/deepseek-r1:ro \
+  docker.io/vllm/vllm-openai:latest \
+  --model /models/deepseek-r1 \
+  --tensor-parallel-size 4 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.90 \
+  --enforce-eager \
+  --trust-remote-code
