@@ -1,0 +1,10 @@
+
+curl http://localhost:8555/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/models/deepseek-r1",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 512,
+    "stream": true,
+    "chat_template_kwargs": {"enable_thinking": true}
+  }'
