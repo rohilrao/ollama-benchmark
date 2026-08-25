@@ -570,18 +570,20 @@ class LatencyBenchmark(OllamaBenchmarkBase):
         self._save_plot(fig, filename)
 
 
-# ── Multi-model VRAM benchmark ──────────────────────────────────────────────
-class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
+# ── Multi-model benchmark (combined VRAM + latency) ─────────────────────────
+class MultiModelBenchmark(OllamaBenchmarkBase):
     """
-    Measures combined VRAM usage when two or more models are loaded and
-    generating *simultaneously* on the same GPU. Generalizes VRAMBenchmark
-    from a single (n, num_ctx, pad_words) grid to N independent per-model
-    grids, cross-producted together.
+    Measures combined VRAM usage AND per-model latency when two or more
+    models are loaded and generating *simultaneously* on the same GPU.
+    Generalizes VRAMBenchmark/LatencyBenchmark from a single (n, num_ctx,
+    pad_words) grid to N independent per-model grids, cross-producted
+    together.
 
     Each grid point: unload every model -> fire concurrent load at every
     model at once (one gather() per model, so failures are attributable to
-    a specific model) -> read `ollama ps` once and report each model's VRAM
-    plus the combined total.
+    a specific model) -> read `ollama ps` once for combined VRAM, and
+    average each model's own per-request latency (wall time, TTFT, tok/s)
+    over its own concurrent requests.
 
     model_specs: list of dicts, one per model:
         {"model": str, "n_list": list[int], "ctx_list": list[int|None],
@@ -595,13 +597,32 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
 
     Failed grid points (OOM/crash/timeout on any model) are recorded, not
     fatal — matching the recovery behavior of the rest of this file.
+
+    output_dir is the user-provided BASE directory (default "."). Results
+    are actually written to <output_dir>/results/<model1>_<model2>_.../ —
+    that subfolder is computed automatically from model_specs and created
+    for you, so runs against different model combinations never collide or
+    overwrite each other's CSV/plots.
     """
 
     def __init__(self, host: str, model_specs: list, output_dir: str = ".", verbose: bool = True,
                  request_timeout: float = 240.0, capture_ps_snapshots: bool = True):
         label = "+".join(spec["model"] for spec in model_specs)
-        super().__init__(host, label, output_dir, verbose, request_timeout, capture_ps_snapshots)
+        results_dir = self._results_subdir(output_dir, model_specs)
+        super().__init__(host, label, results_dir, verbose, request_timeout, capture_ps_snapshots)
         self.model_specs = model_specs
+        self.base_output_dir = output_dir
+
+    @staticmethod
+    def _sanitize_model_name(name: str) -> str:
+        """Model tags often contain ':' or '/' (e.g. 'qwen3:32b-q4_k_m',
+        'org/model'), which aren't safe as path components on every OS."""
+        return name.replace(":", "-").replace("/", "-").replace("\\", "-")
+
+    @classmethod
+    def _results_subdir(cls, base_dir: str, model_specs: list) -> str:
+        names = "_".join(cls._sanitize_model_name(spec["model"]) for spec in model_specs)
+        return os.path.join(base_dir, "results", names)
 
     def _configs_label(self, configs: list) -> str:
         return " | ".join(
@@ -656,19 +677,54 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
         return {"per_model": per_model, "vram_total_mb": vram_total,
                 "all_loaded": all_loaded, "all_fully_on_gpu": all_fully_on_gpu}
 
-    async def run_request(self, model: str, i: int, num_ctx: int = None, pad_words: int = 0):
+    async def run_request(self, model: str, i: int, num_ctx: int = None, pad_words: int = 0) -> dict:
+        """
+        Runs one streaming request against `model` and returns its latency
+        metrics (same shape as LatencyBenchmark.run_request): wall time,
+        TTFT, tok/s, and thinking/content token counts.
+        """
         options = {"temperature": 0.0}
         if num_ctx:
             options["num_ctx"] = num_ctx
 
+        output_tokens = 0
+        eval_duration_ns = 0
+        ttft = None
         token_index = 0
+        thinking_tokens = 0
+        content_tokens = 0
+
+        start = time.perf_counter()
         async for chunk in await self.client.chat(
             model=model,
             messages=[{"role": "user", "content": self.make_prompt(pad_words)}],
             stream=True,
             options=options,
         ):
-            token_index, _, _ = self._stream_tokens(chunk, i, token_index, self._log)
+            token_index, got_thinking, got_content = self._stream_tokens(chunk, i, token_index, self._log)
+            if got_thinking:
+                thinking_tokens += 1
+            if got_content:
+                content_tokens += 1
+
+            if ttft is None and (got_thinking or got_content):
+                ttft = time.perf_counter() - start
+
+            if chunk.get("done"):
+                output_tokens = chunk.get("eval_count", 0)
+                eval_duration_ns = chunk.get("eval_duration", 0)
+
+        wall_time = time.perf_counter() - start
+        tps = output_tokens / (eval_duration_ns / 1e9) if eval_duration_ns > 0 else 0.0
+
+        return {
+            "wall_time_sec": wall_time,
+            "ttft_sec": ttft if ttft is not None else wall_time,
+            "tokens_per_sec": tps,
+            "output_tokens": output_tokens,
+            "thinking_tokens": thinking_tokens,
+            "content_tokens": content_tokens,
+        }
 
     async def _attempt_recovery(self, extra_sleep: float = 3.0):
         """Pings every model in model_specs (not just one) before continuing."""
@@ -688,12 +744,18 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
         except Exception as e:
             self._log(f"  Recovery ping failed too ({e}); continuing to next grid point anyway.")
 
+    @staticmethod
+    def _empty_latency() -> dict:
+        return {"wall_time_sec": None, "ttft_sec": None, "tokens_per_sec": None,
+                "batch_tokens_per_sec": None, "thinking_tokens": None, "content_tokens": None}
+
     async def measure_batch(self, configs: list) -> dict:
         """
         configs: list of {"model", "n", "num_ctx", "pad_words"}, one per model
         (same order as self.model_specs). Fires one gather() per model so a
         failure is attributable to a specific model rather than "something
-        failed". Never raises.
+        failed". On success, returns combined VRAM plus each model's own
+        averaged latency over its concurrent requests. Never raises.
         """
         batch_start = time.perf_counter()
 
@@ -706,8 +768,10 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
             await self._attempt_recovery()
             return {"status": status, "error_message": f"unload_failed: {err_msg}",
                     "vram_total_mb": None, "elapsed_time_sec": elapsed,
-                    "per_model_status": {c["model"]: status for c in configs}}
+                    "per_model_status": {c["model"]: status for c in configs},
+                    "per_model_latency": {c["model"]: self._empty_latency() for c in configs}}
 
+        per_model_successes = {}
         per_model_errors = {}
         pending = []
         for cfg in configs:
@@ -720,6 +784,8 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
         for model, coro in pending:
             results = await coro
             errors = [r for r in results if isinstance(r, Exception)]
+            successes = [r for r in results if not isinstance(r, Exception)]
+            per_model_successes[model] = successes
             per_model_errors[model] = errors[0] if errors else None
         self._log("")
         elapsed = time.perf_counter() - batch_start
@@ -734,7 +800,8 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
             self._log(f"  ✗ FAILED {self._configs_label(configs)}: {'; '.join(msgs)}")
             row = {"status": "partial_or_full_failure", "error_message": "; ".join(msgs),
                    "vram_total_mb": None, "elapsed_time_sec": elapsed,
-                   "per_model_status": {c["model"]: statuses.get(c["model"], "ok") for c in configs}}
+                   "per_model_status": {c["model"]: statuses.get(c["model"], "ok") for c in configs},
+                   "per_model_latency": {c["model"]: self._empty_latency() for c in configs}}
             if self.capture_ps_snapshots:
                 row["ps_after"] = await self._ps_snapshot()
             await self._attempt_recovery()
@@ -745,18 +812,39 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
             if not breakdown["all_fully_on_gpu"]:
                 pcts = {m: d["gpu_pct"] for m, d in breakdown["per_model"].items()}
                 self._log(f"  ⚠ Not all models fully on GPU for {self._configs_label(configs)}: {pcts}")
+
+            per_model_latency = {}
+            combined_batch_tps = 0.0
+            for cfg in configs:
+                model = cfg["model"]
+                results = per_model_successes[model]
+                total_tokens = sum(r["output_tokens"] for r in results)
+                batch_tps = total_tokens / elapsed if elapsed > 0 else 0.0
+                combined_batch_tps += batch_tps
+                per_model_latency[model] = {
+                    "wall_time_sec": statistics.mean(r["wall_time_sec"] for r in results),
+                    "ttft_sec": statistics.mean(r["ttft_sec"] for r in results),
+                    "tokens_per_sec": statistics.mean(r["tokens_per_sec"] for r in results),
+                    "batch_tokens_per_sec": batch_tps,
+                    "thinking_tokens": statistics.mean(r["thinking_tokens"] for r in results),
+                    "content_tokens": statistics.mean(r["content_tokens"] for r in results),
+                }
+
             return {"status": "ok", "error_message": None, "elapsed_time_sec": elapsed,
                     "vram_total_mb": breakdown["vram_total_mb"],
                     "all_loaded": breakdown["all_loaded"],
                     "all_fully_on_gpu": breakdown["all_fully_on_gpu"],
                     "per_model_status": {c["model"]: "ok" for c in configs},
-                    "per_model_breakdown": breakdown["per_model"]}
+                    "per_model_breakdown": breakdown["per_model"],
+                    "per_model_latency": per_model_latency,
+                    "combined_batch_tokens_per_sec": combined_batch_tps}
         except Exception as e:
             status, err_msg = self._classify_error(e)
             self._log(f"  ✗ VRAM read failed {self._configs_label(configs)}: {status} — {err_msg}")
             return {"status": "ps_read_error", "error_message": err_msg,
                     "vram_total_mb": None, "elapsed_time_sec": elapsed,
-                    "per_model_status": {c["model"]: "ok" for c in configs}}
+                    "per_model_status": {c["model"]: "ok" for c in configs},
+                    "per_model_latency": {c["model"]: self._empty_latency() for c in configs}}
 
     async def run_grid_search(self) -> list:
         """
@@ -800,12 +888,15 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
                 "vram_total_mb": result.get("vram_total_mb"),
                 "all_loaded": result.get("all_loaded"),
                 "all_fully_on_gpu": result.get("all_fully_on_gpu"),
+                "combined_batch_tokens_per_sec": result.get("combined_batch_tokens_per_sec"),
             }
             per_model_status = result.get("per_model_status", {})
             per_model_breakdown = result.get("per_model_breakdown", {})
+            per_model_latency = result.get("per_model_latency", {})
             for idx, cfg in enumerate(configs):
                 prefix = f"m{idx}"
                 bd = per_model_breakdown.get(cfg["model"]) if per_model_breakdown else None
+                lat = per_model_latency.get(cfg["model"]) if per_model_latency else self._empty_latency()
                 row[f"{prefix}_model"] = cfg["model"]
                 row[f"{prefix}_n"] = cfg["n"]
                 row[f"{prefix}_num_ctx"] = cfg["num_ctx"]
@@ -813,11 +904,21 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
                 row[f"{prefix}_status"] = per_model_status.get(cfg["model"], "unknown")
                 row[f"{prefix}_vram_mb"] = bd["vram_mb"] if bd else None
                 row[f"{prefix}_gpu_pct"] = bd["gpu_pct"] if bd else None
+                row[f"{prefix}_wall_time_sec"] = lat["wall_time_sec"]
+                row[f"{prefix}_ttft_sec"] = lat["ttft_sec"]
+                row[f"{prefix}_tokens_per_sec"] = lat["tokens_per_sec"]
+                row[f"{prefix}_batch_tokens_per_sec"] = lat["batch_tokens_per_sec"]
+                row[f"{prefix}_thinking_tokens"] = lat["thinking_tokens"]
+                row[f"{prefix}_content_tokens"] = lat["content_tokens"]
             rows.append(row)
 
             if result["status"] == "ok":
+                ttft_bits = ", ".join(
+                    f"{cfg['model']} ttft={result['per_model_latency'][cfg['model']]['ttft_sec']:.2f}s"
+                    for cfg in configs
+                )
                 self._log(f"  {self._configs_label(configs)}  "
-                          f"vram_total={result['vram_total_mb']:.0f}MB")
+                          f"vram_total={result['vram_total_mb']:.0f}MB  ({ttft_bits})")
 
         n_failed = sum(1 for r in rows if r["status"] != "ok")
         if n_failed:
@@ -828,10 +929,12 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
         """Convenience alias for run_grid_search()."""
         return await self.run_grid_search()
 
-    def save_results(self, rows: list, filename: str = "multi_model_vram_results.csv"):
+    def save_results(self, rows: list, filename: str = "results.csv"):
+        """Saves to <output_dir>/results/<model1>_<model2>_.../<filename> —
+        the model-combo subfolder was already created in __init__."""
         self.save_csv(rows, filename)
 
-    def plot_results(self, rows: list, filename: str = "multi_model_vram_benchmark.png"):
+    def plot_results(self, rows: list, filename: str = "vram.png"):
         """
         Currently only plots the 2-model case cleanly (VRAM total vs. model
         A's n, one line per distinct model-B config + model-A ctx/pad combo).
@@ -876,14 +979,74 @@ class MultiModelVRAMBenchmark(OllamaBenchmarkBase):
 
         self._save_plot(fig, filename)
 
+    def plot_latency(self, rows: list, metric: str = "ttft_sec", filename: str = None):
+        """
+        Same 2-model-only structure as plot_results, but for a per-model
+        latency metric instead of VRAM. metric is one of: "ttft_sec",
+        "wall_time_sec", "tokens_per_sec", "batch_tokens_per_sec". Plots
+        BOTH models' values (m0_<metric> and m1_<metric>) vs. model A's n,
+        one line pair per distinct "other config" grouping.
+        """
+        if len(self.model_specs) != 2:
+            self._log(f"plot_latency only supports exactly 2 models today (got "
+                       f"{len(self.model_specs)}); skipping plot — use the CSV directly.")
+            return
+
+        valid_metrics = {"ttft_sec", "wall_time_sec", "tokens_per_sec", "batch_tokens_per_sec"}
+        if metric not in valid_metrics:
+            self._log(f"Unknown latency metric '{metric}'; expected one of {sorted(valid_metrics)}.")
+            return
+
+        ok_rows = [r for r in rows if r.get("status") == "ok"]
+        if not ok_rows:
+            self._log("No successful measurements to plot.")
+            return
+
+        if filename is None:
+            filename = f"latency_{metric}.png"
+
+        def group_key(r):
+            return (r["m0_num_ctx"], r["m0_pad_words"], r["m1_n"], r["m1_num_ctx"], r["m1_pad_words"])
+
+        groups = {}
+        for r in ok_rows:
+            groups.setdefault(group_key(r), []).append(r)
+
+        model_a, model_b = self.model_specs[0]["model"], self.model_specs[1]["model"]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for key, sub in sorted(groups.items(), key=lambda kv: str(kv[0])):
+            sub = sorted(sub, key=lambda r: r["m0_n"])
+            ctx0, pad0, n1, ctx1, pad1 = key
+            label_suffix = f"ctx0={ctx0},pad0={pad0} | B: n={n1},ctx={ctx1},pad={pad1}"
+            ax.plot([r["m0_n"] for r in sub], [r[f"m0_{metric}"] for r in sub],
+                     marker="o", linestyle="-", label=f"{model_a} ({label_suffix})")
+            ax.plot([r["m0_n"] for r in sub], [r[f"m1_{metric}"] for r in sub],
+                     marker="s", linestyle="--", label=f"{model_b} ({label_suffix})")
+
+        ax.set_title(f"{metric} under concurrent load — {model_a} + {model_b}")
+        ax.set_xlabel(f"Concurrent requests to {model_a} (n)")
+        ax.set_ylabel(metric)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=6, ncol=1)
+
+        self._save_plot(fig, filename)
+
+
+# Backward-compatible alias — the class used to be VRAM-only.
+MultiModelVRAMBenchmark = MultiModelBenchmark
 
 # ── Example usage ──────────────────────────────────────────────────────────
-async def _main():
+async def _main(output_dir: str = "."):
     # VRAM benchmark: full grid search over n x num_ctx x pad_words.
     # NOTE: total measurements = len(n_list) * len(ctx_list) * len(pad_list),
     # each doing a full model unload + generation — keep lists small for a
     # quick smoke test, then widen them for the real run. Failed configs
     # (OOM, runner crash, timeout) are recorded, not fatal.
+    #
+    # `output_dir` is the BASE directory (e.g. "." or wherever the user
+    # points it, via --output-dir below); vram/ and latency/ subfolders are
+    # created under it per run.
 
     HOST="http://localhost:11458"
     MODEL="qwen3-235b-a22b:q4_k_m" #"mistral-small3.2:24b"
@@ -891,8 +1054,9 @@ async def _main():
     CTX_LIST=[32768, 65536, 131072]
     PAD_LIST=[0]
 
-    OUTPUT_DIR_VRAM = "./qwen3_235b_np40_mlm3/vram"
-    OUTPUT_DIR_LATENCY = "./qwen3_235b_np40_mlm3/latency"
+    run_dir = os.path.join(output_dir, "qwen3_235b_np40_mlm3")
+    OUTPUT_DIR_VRAM = os.path.join(run_dir, "vram")
+    OUTPUT_DIR_LATENCY = os.path.join(run_dir, "latency")
     REQUEST_TIMEOUT=240.0
 
     NUM_REPS = 2 #m
@@ -927,15 +1091,20 @@ async def _main():
     latency_bench.plot_results(latency_summary)
 
 
-async def _main_multi_model():
-    # Two-model combined-VRAM benchmark: both models loaded and generating
+async def _main_multi_model(output_dir: str = "."):
+    # Combined VRAM + latency benchmark: both models loaded and generating
     # simultaneously, full independent (n, num_ctx) grid per model, cross-
     # producted together. Generalizes to 3+ models by adding more specs —
     # just watch the combination count (logged up front) since it multiplies
     # across every model's grid.
+    #
+    # `output_dir` is the BASE directory (e.g. "." or wherever the user
+    # points it, via --output-dir below). Actual results land in
+    # <output_dir>/results/<model1>_<model2>_.../ — that subfolder is
+    # derived from the model names automatically, so different model
+    # combinations never collide or overwrite each other's CSV/plots.
 
     HOST = "http://localhost:11458"
-    OUTPUT_DIR = "./multi_model_vram"
     REQUEST_TIMEOUT = 240.0
 
     MODEL_SPECS = [
@@ -953,18 +1122,34 @@ async def _main_multi_model():
         },
     ]
 
-    bench = MultiModelVRAMBenchmark(
+    bench = MultiModelBenchmark(
         host=HOST,
         model_specs=MODEL_SPECS,
-        output_dir=OUTPUT_DIR,
+        output_dir=output_dir,
         verbose=True,
         request_timeout=REQUEST_TIMEOUT,
     )
     rows = await bench.run_grid_search()
-    bench.save_results(rows)
-    bench.plot_results(rows)
+    bench.save_results(rows)          # -> <output_dir>/results/<models>/results.csv
+    bench.plot_results(rows)          # -> .../vram.png
+    bench.plot_latency(rows, metric="ttft_sec")            # -> .../latency_ttft_sec.png
+    bench.plot_latency(rows, metric="tokens_per_sec")       # -> .../latency_tokens_per_sec.png
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
-    # asyncio.run(_main_multi_model())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ollama VRAM/latency benchmarks")
+    parser.add_argument("--mode", choices=["single", "multi"], default="single",
+                         help="'single' runs the single-model VRAM+latency benchmark; "
+                              "'multi' runs the combined multi-model benchmark.")
+    parser.add_argument("--output-dir", default=".",
+                         help="Base directory for results (default: current directory). "
+                              "For --mode multi, results are written under "
+                              "<output-dir>/results/<model1>_<model2>_.../")
+    args = parser.parse_args()
+
+    if args.mode == "multi":
+        asyncio.run(_main_multi_model(output_dir=args.output_dir))
+    else:
+        asyncio.run(_main(output_dir=args.output_dir))
