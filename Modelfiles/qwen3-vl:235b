@@ -1,0 +1,6 @@
+TEMPLATE {{ .Prompt }}
+RENDERER qwen3-vl-thinking
+PARSER qwen3-vl-thinking
+PARAMETER temperature 1
+PARAMETER top_k 20
+PARAMETER top_p 0.95
