@@ -188,6 +188,25 @@ class OllamaBenchmarkBase:
             raise asyncio.TimeoutError(
                 f"load of {model} (num_ctx={num_ctx}) exceeded load_timeout of {self.load_timeout}s")
 
+    async def warmup(self, model: str, num_ctx: int = None):
+        """
+        One throwaway generation, on top of `load()`. Being resident isn't the
+        same as being warm: the first real generation after a load still pays
+        for CUDA kernel JIT / cuBLAS autotune / cache warming that later
+        generations don't, which otherwise shows up as an inflated TTFT on
+        whichever request happens to run first. Errors are logged, not raised —
+        a failed warmup shouldn't lose an otherwise-good grid point.
+        """
+        options = {"num_ctx": num_ctx} if num_ctx else {}
+        try:
+            async for _ in await self.client.chat(
+                model=model, messages=[{"role": "user", "content": "hello"}],
+                stream=True, options=options, keep_alive=self.keep_alive,
+            ):
+                pass
+        except Exception as e:
+            self._log(f"  warmup for {model} failed (ignored): {e}")
+
     async def recover(self, models: list, sleep: float = 3.0):
         """Best-effort post-failure recovery; logged, never raised."""
         self._log(f"  recovering (sleep {sleep}s, then pinging {len(models)} model(s))...")
