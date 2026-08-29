@@ -85,28 +85,44 @@ class OllamaBenchmarkBase:
 
         Returns {per_model: {name: {loaded, vram_gb, total_gb, cpu_gb, gpu_pct,
                  cpu_pct, fully_on_gpu}}, vram_total_gb, cpu_total_gb,
-                 all_loaded, all_fully_on_gpu}. Sizes are GB (GiB, 1024^3).
+                 all_loaded, all_fully_on_gpu}.
+
+        Sizes are decimal GB (1000^3), matching the `ollama ps` CLI's own SIZE
+        column (format.HumanBytes), so a value here agrees with the CLI's printed
+        size for the same model.
+
+        `size`/`size_vram` come from the runner's MemorySize(), i.e. buffers
+        allocated at load (weights + KV cache for num_ctx x OLLAMA_NUM_PARALLEL).
+        They are not a live GPU reading and do not grow as the KV cache fills.
         """
         resp = await self.client.ps()
         found = {m.model: m for m in resp.models}
 
         per_model, vram_total, cpu_total = {}, 0.0, 0.0
-        GB = 1024 ** 3
+        GB = 1000 ** 3  # decimal GB, matching the `ollama ps` CLI's own SIZE column
         for name in models:
             # `ollama ps` reports "qwen3:latest" for a bare "qwen3" request.
             m = found.get(name) or found.get(f"{name}:latest")
             if m is None:
                 per_model[name] = {"loaded": False, "vram_gb": 0.0, "total_gb": 0.0, "cpu_gb": 0.0,
-                                   "gpu_pct": None, "cpu_pct": None, "fully_on_gpu": None}
+                                   "gpu_pct": None, "cpu_pct": None, "fully_on_gpu": None,
+                                   "ctx_reported": None}
                 continue
             vram_gb = (getattr(m, "size_vram", 0) or 0) / GB
             total_gb = (getattr(m, "size", 0) or 0) / GB
-            cpu_gb = max(total_gb - vram_gb, 0.0)   # the part that spilled to system RAM
-            gpu_pct = round(100 * vram_gb / total_gb, 1) if total_gb > 0 else None
+            if total_gb <= 0 or vram_gb > total_gb:
+                # Same case `ollama ps` prints as "Unknown"; don't invent a split.
+                cpu_gb, gpu_pct, cpu_pct, fully = 0.0, None, None, None
+            else:
+                cpu_gb = total_gb - vram_gb          # the part that spilled to system RAM
+                gpu_pct = round(100 * vram_gb / total_gb, 1)
+                cpu_pct = round(100 - gpu_pct, 1)
+                fully = gpu_pct >= 99.95
             per_model[name] = {"loaded": True, "vram_gb": vram_gb, "total_gb": total_gb,
-                               "cpu_gb": cpu_gb, "gpu_pct": gpu_pct,
-                               "cpu_pct": None if gpu_pct is None else round(100 - gpu_pct, 1),
-                               "fully_on_gpu": None if gpu_pct is None else gpu_pct >= 99.95}
+                               "cpu_gb": cpu_gb, "gpu_pct": gpu_pct, "cpu_pct": cpu_pct,
+                               "fully_on_gpu": fully,
+                               # What the runner actually loaded, vs what we asked for.
+                               "ctx_reported": getattr(m, "context_length", None) or None}
             vram_total += vram_gb
             cpu_total += cpu_gb
 
@@ -119,7 +135,7 @@ class OllamaBenchmarkBase:
         try:
             resp = await self.client.ps()
             return json.dumps([{"model": m.model,
-                                "vram_gb": round((getattr(m, "size_vram", 0) or 0) / 1024 ** 3, 2)}
+                                "vram_gb": round((getattr(m, "size_vram", 0) or 0) / 1000 ** 3, 2)}
                                for m in resp.models])
         except Exception as e:
             return f"ps_snapshot_failed: {e}"
