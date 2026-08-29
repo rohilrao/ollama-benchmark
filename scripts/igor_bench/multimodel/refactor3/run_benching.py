@@ -13,7 +13,7 @@ from multi_model_bench import MultiModelBenchmark
 async def main(
     host: str = "http://localhost:11434",   # Ollama server URL
     model_specs: list = None,               # one dict per model; see the call below
-    output_dir: str = ".",                  # results land in <output_dir>/results/<models>/
+    output_dir: str = ".",                  # results land in <output_dir>/<models>/
     reps: int = 1,                          # repeats per grid point; each rep is its own CSV row
     request_timeout: float = 240.0,         # seconds allowed for one generation request
     load_timeout: float = 900.0,            # seconds allowed to cold-load one model
@@ -33,7 +33,8 @@ async def main(
     )
     try:
         rows = await bench.run_grid_search()
-        bench.save_results(rows)   # -> <output_dir>/results/<models>/results.csv (one row per rep)
+        bench.save_config()        # -> <output_dir>/<models>/config.txt
+        bench.save_results(rows)   # -> <output_dir>/<models>/results.csv (one row per rep)
         bench.save_averaged(rows)  # -> .../results_avg.csv (averaged over reps, with std)
         bench.plot_all(rows)       # -> vram.png, latency_<metric>.png
         return rows
