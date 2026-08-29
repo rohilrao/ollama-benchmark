@@ -24,6 +24,7 @@ from ollama_bench import OllamaBenchmarkBase
 
 METRICS = ("wall_time_sec", "ttft_sec", "ttft_thinking_sec", "ttft_content_sec",
            "tokens_per_sec", "batch_tokens_per_sec")
+SPREAD_METRICS = ("ttft_thinking_sec", "ttft_content_sec")   # get _min/_max across the batch
 PLOTTABLE = METRICS + ("load_sec",)   # load_sec is measured per model, not per request
 
 
@@ -85,7 +86,9 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
 
     @staticmethod
     def _blank_metrics() -> dict:
-        return {k: None for k in METRICS + ("output_tokens", "thinking_tokens", "content_tokens")}
+        spread_keys = tuple(f"{m}{suf}" for m in SPREAD_METRICS for suf in ("_min", "_max"))
+        return {k: None for k in METRICS + spread_keys +
+                ("output_tokens", "thinking_tokens", "content_tokens")}
 
     def _placement(self, bd: dict, load_sec: dict, name: str) -> dict:
         """Where the model physically sits, per `ollama ps`. Recorded on every
@@ -225,6 +228,11 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
                 row.update({m: statistics.mean(r[m] for r in oks)
                             for m in ("wall_time_sec", "ttft_sec", "ttft_thinking_sec",
                                      "ttft_content_sec", "tokens_per_sec")})
+                # Spread across the N requests in this batch — the mean alone
+                # hides whether one request straggled far behind the rest.
+                for m in SPREAD_METRICS:
+                    row[f"{m}_min"] = min(r[m] for r in oks)
+                    row[f"{m}_max"] = max(r[m] for r in oks)
                 row.update({"batch_tokens_per_sec": tokens / span if span > 0 else 0.0,
                             "output_tokens": tokens,
                             "thinking_tokens": statistics.mean(r["thinking_tokens"] for r in oks),
@@ -318,6 +326,8 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
                         "cpu_total_gb": res["cpu_total_gb"], "all_on_gpu": res["all_on_gpu"],
                         "load_sec": pm.get("load_sec"), "point_elapsed_sec": res["elapsed_sec"],
                         **{m: pm.get(m) for m in METRICS},
+                        **{f"{m}{suf}": pm.get(f"{m}{suf}")
+                           for m in SPREAD_METRICS for suf in ("_min", "_max")},
                         "output_tokens": pm.get("output_tokens"),
                         "thinking_tokens": pm.get("thinking_tokens"),
                         "content_tokens": pm.get("content_tokens"),
@@ -325,13 +335,16 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
                         "error": pm.get("error") or res["error"],
                     })
                 if res["status"] == "ok":
+                    def fmt_ttft(pm, base, count_key):
+                        if pm[count_key] in (0, None):
+                            return "-"
+                        return f"{pm[base]:.2f}s [{pm[base+'_min']:.2f}-{pm[base+'_max']:.2f}]"
                     detail = "  ".join(
-                        "{m} load={l:.1f}s ttft_think={tk} ttft_content={c:.2f}s".format(
+                        "{m} load={l:.1f}s think={tk} content={c}".format(
                             m=c["model"],
                             l=res["per_model"][c["model"]]["load_sec"] or 0.0,
-                            tk=("-" if res["per_model"][c["model"]]["thinking_tokens"] in (0, None)
-                                else f"{res['per_model'][c['model']]['ttft_thinking_sec']:.2f}s"),
-                            c=res["per_model"][c["model"]]["ttft_content_sec"])
+                            tk=fmt_ttft(res["per_model"][c["model"]], "ttft_thinking_sec", "thinking_tokens"),
+                            c=fmt_ttft(res["per_model"][c["model"]], "ttft_content_sec", "content_tokens"))
                         for c in configs)
                     self._log(f"  ok  vram_total={res['vram_total_gb']:.2f}GB  "
                               f"elapsed={res['elapsed_sec']:.1f}s  {detail}")
@@ -370,8 +383,9 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
         """
         placement = ("vram_gb", "cpu_gb", "total_gb", "gpu_pct", "cpu_pct",
                      "vram_total_gb", "cpu_total_gb", "load_sec", "ctx_reported")
-        perf = METRICS + ("point_elapsed_sec", "output_tokens",
-                          "thinking_tokens", "content_tokens")
+        spread_cols = tuple(f"{m}{suf}" for m in SPREAD_METRICS for suf in ("_min", "_max"))
+        perf = METRICS + spread_cols + ("point_elapsed_sec", "output_tokens",
+                                        "thinking_tokens", "content_tokens")
         spread = ("load_sec", "vram_gb", "wall_time_sec", "ttft_content_sec",
                   "tokens_per_sec", "batch_tokens_per_sec")
 
