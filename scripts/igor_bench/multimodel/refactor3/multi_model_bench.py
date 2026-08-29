@@ -92,7 +92,7 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
         return {"load_sec": load_sec.get(name),
                 "vram_gb": bd.get("vram_gb"), "total_gb": bd.get("total_gb"),
                 "cpu_gb": bd.get("cpu_gb"), "gpu_pct": bd.get("gpu_pct"),
-                "cpu_pct": bd.get("cpu_pct")}
+                "cpu_pct": bd.get("cpu_pct"), "ctx_reported": bd.get("ctx_reported")}
 
     # ── one grid point ────────────────────────────────────────────────────
     async def measure_point(self, configs: list) -> dict:
@@ -137,6 +137,24 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
             for m in missing:
                 placed[m]["status"] = "not_loaded"
             return {"status": "eviction_or_oom", "error": f"not_resident: {' '.join(missing)}",
+                    **head, "per_model": placed}
+
+        # Ollama retries a load that OOM'd with a smaller context (sched.go
+        # reduceAutoNumCtxForLoadOOM) and returns success, so the runner can be
+        # holding a context we never asked for. `ollama ps` reports what it
+        # actually loaded; anything smaller than requested makes the point a
+        # measurement of a different configuration.
+        shrunk = {}
+        for c in configs:
+            got = loaded["per_model"][c["model"]]["ctx_reported"]
+            if c["num_ctx"] and got and got < c["num_ctx"]:
+                shrunk[c["model"]] = (got, c["num_ctx"])
+        if shrunk:
+            detail = " ".join(f"{m}: loaded {got} not {want}" for m, (got, want) in shrunk.items())
+            self._log(f"  ✗ context silently reduced after a load OOM — skipping: {detail}")
+            for m in shrunk:
+                placed[m]["status"] = "ctx_reduced"
+            return {"status": "ctx_reduced", "error": f"ctx_reduced: {detail}",
                     **head, "per_model": placed}
 
         # A model that spilled into system RAM is running partly on CPU: its
@@ -228,7 +246,12 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
                 "per_model": per_model}
 
     async def _sample_vram(self, stop: asyncio.Event, baseline: dict) -> dict:
-        """Poll `ollama ps` during generation and keep the highest total seen."""
+        """
+        Poll `ollama ps` during generation and keep the highest total seen. Note
+        that size_vram is a load-time allocation, not a live reading, so this
+        will not show the KV cache filling — it catches a model being evicted or
+        reloaded mid-run, which would otherwise go unnoticed.
+        """
         peak = baseline
         while not stop.is_set():
             try:
@@ -278,7 +301,8 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
                     rows.append({
                         "point": p, "rep": rep, "point_tag": tag,
                         "model": cfg["model"], "n": cfg["n"],
-                        "num_ctx": cfg["num_ctx"], "pad_words": cfg["pad_words"],
+                        "num_ctx": cfg["num_ctx"], "ctx_reported": pm.get("ctx_reported"),
+                        "pad_words": cfg["pad_words"],
                         "point_status": res["status"], "model_status": pm["status"],
                         "vram_gb": pm.get("vram_gb"), "cpu_gb": pm.get("cpu_gb"),
                         "total_gb": pm.get("total_gb"),
@@ -338,7 +362,7 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
         toward zero. `_std` columns are sample stdev, 0.0 when there's one rep.
         """
         placement = ("vram_gb", "cpu_gb", "total_gb", "gpu_pct", "cpu_pct",
-                     "vram_total_gb", "cpu_total_gb", "load_sec")
+                     "vram_total_gb", "cpu_total_gb", "load_sec", "ctx_reported")
         perf = METRICS + ("point_elapsed_sec", "output_tokens",
                           "thinking_tokens", "content_tokens")
         spread = ("load_sec", "vram_gb", "wall_time_sec", "ttft_content_sec",
