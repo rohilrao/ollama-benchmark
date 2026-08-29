@@ -36,7 +36,7 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
     Grid points = product of every model's own (n x ctx x pad) combos, so the
     count grows fast with more models; it's logged up front.
 
-    Results land in <output_dir>/results/<model1>_<model2>_.../ so different
+    Results land in <output_dir>/<model1>_<model2>_.../ so different
     model combinations never overwrite each other.
     """
 
@@ -68,7 +68,7 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
 
     @classmethod
     def _results_dir(cls, base: str, specs: list) -> str:
-        return os.path.join(base, "results", "_".join(cls._safe(s["model"]) for s in specs))
+        return os.path.join(base, "_".join(cls._safe(s["model"]) for s in specs))
 
     @classmethod
     def _cfg_tag(cls, cfg: dict) -> str:
@@ -400,6 +400,33 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
 
     def save_averaged(self, rows: list, filename: str = "results_avg.csv"):
         self.save_csv(self.average_reps(rows), filename)
+
+    def save_config(self, filename: str = "config.txt"):
+        """Plain-text record of what was actually swept, dropped in the results
+        folder alongside the CSVs — so a run is self-describing without having
+        to reread the script that produced it."""
+        lines = [f"host: {self.host}",
+                 f"reps: {self.reps}",
+                 f"request_timeout_sec: {self.request_timeout}",
+                 f"load_timeout_sec: {self.load_timeout}",
+                 f"keep_alive: {self.keep_alive}",
+                 f"min_gpu_pct: {self.min_gpu_pct}",
+                 f"skip_on_cpu_offload: {self.skip_on_cpu_offload}",
+                 "", "models:"]
+        for s in self.model_specs:
+            lines.append(f"  {s['model']}")
+            lines.append(f"    n_list:   {s['n_list']}")
+            lines.append(f"    ctx_list: {s['ctx_list']}")
+            lines.append(f"    pad_list: {s['pad_list']}")
+        n_points = 1
+        for s in self.model_specs:
+            n_points *= len(s["n_list"]) * len(s["ctx_list"]) * len(s["pad_list"])
+        lines += ["", f"grid points: {n_points}", f"total measurements (points x reps): {n_points * self.reps}"]
+
+        path = os.path.join(self.output_dir, filename)
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        self._log(f"Saved config → {path}")
 
     def _points(self, rows: list, need: str) -> tuple:
         """(ordered point tags, {model: [value per point]}) averaged over reps."""
