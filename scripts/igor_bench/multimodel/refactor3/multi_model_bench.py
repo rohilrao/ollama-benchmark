@@ -4,6 +4,7 @@ One grid point =
     unload everything
  -> load every model to residency, at the exact num_ctx it will be benched at
  -> verify via `ollama ps` that all of them are actually resident
+ -> send one untimed warmup generation per model (resident is not warm)
  -> release every request across every model at the same instant
  -> sample VRAM while they generate, and average each model's own latency.
 
@@ -172,6 +173,12 @@ class MultiModelBenchmark(OllamaBenchmarkBase):
                 return {"status": "cpu_offload", "error": f"cpu_offload: {detail}",
                         **head, "per_model": placed}
             self._log(f"  ⚠ CPU offload (benching anyway, skip_on_cpu_offload=False): {detail}")
+
+        # ── warmup — resident is not warm; do this before anything is timed.
+        # The first generation after a load still pays for CUDA kernel JIT /
+        # cache warming, which otherwise inflates TTFT for whichever request
+        # happens to run first.
+        await asyncio.gather(*(self.warmup(c["model"], c["num_ctx"]) for c in configs))
 
         # ── generation phase — all requests released together ────────────
         gate = asyncio.Event()
