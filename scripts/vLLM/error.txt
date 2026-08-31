@@ -1,0 +1,7 @@
+RuntimeError: For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16
+(Worker_TP0 pid=682) ERROR 08-31 18:50:16 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=822) ERROR 08-31 18:50:16 [multiproc_executor.py:1007]
+(Worker_TP0 pid=682) ERROR 08-31 18:50:16 [multiproc_executor.py:1007] RuntimeError: For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16
+(Worker_TP0 pid=682) ERROR 08-31 18:50:16 [multiproc_executor.py:1007]
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 1 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
