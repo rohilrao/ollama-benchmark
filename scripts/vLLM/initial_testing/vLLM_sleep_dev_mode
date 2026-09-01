@@ -1,7 +1,7 @@
 import subprocess
 import time
-
 import requests
+
 from langchain_deepseek import ChatDeepSeek
 
 
@@ -10,7 +10,7 @@ from langchain_deepseek import ChatDeepSeek
 # ---------------------------------------------------------------------------
 
 VLLM_URL = "http://localhost:8555"
-MODEL = "/models/qwen235b"
+MODEL = "/models/deepseek-r1"
 
 llm = ChatDeepSeek(
     model=MODEL,
@@ -21,14 +21,13 @@ llm = ChatDeepSeek(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# GPU helpers
 # ---------------------------------------------------------------------------
 
 def print_gpu_status(label: str):
-    """Print GPU memory usage and utilization via nvidia-smi."""
-    print(f"\n{'=' * 70}")
+    print(f"\n{'=' * 75}")
     print(f"GPU STATUS: {label}")
-    print("=" * 70)
+    print("=" * 75)
 
     result = subprocess.run(
         [
@@ -44,18 +43,25 @@ def print_gpu_status(label: str):
     for line in result.stdout.strip().splitlines():
         gpu, used, total, util = [x.strip() for x in line.split(",")]
 
+        used = int(used)
+        total = int(total)
+
         print(
             f"GPU {gpu}: "
-            f"{int(used):6d} / {int(total):6d} MiB "
-            f"({100 * int(used) / int(total):5.1f}%) | "
+            f"{used:6d} / {total:6d} MiB "
+            f"({100 * used / total:5.1f}%) | "
             f"util={util}%"
         )
 
 
+# ---------------------------------------------------------------------------
+# vLLM helpers
+# ---------------------------------------------------------------------------
+
 def is_sleeping():
     response = requests.get(
         f"{VLLM_URL}/is_sleeping",
-        timeout=10,
+        timeout=30,
     )
     response.raise_for_status()
 
@@ -65,8 +71,23 @@ def is_sleeping():
         return response.text.strip()
 
 
-def sleep_model(level=1):
-    print(f"\nPutting model to sleep (level={level})...")
+def sleep_model(level: int):
+    if level == 1:
+        print("\n" + "=" * 75)
+        print("SLEEP LEVEL 1")
+        print("Weights: GPU -> CPU RAM")
+        print("KV cache: discarded")
+        print("Use case: temporarily free GPU and later run SAME model")
+        print("=" * 75)
+
+    elif level == 2:
+        print("\n" + "=" * 75)
+        print("SLEEP LEVEL 2")
+        print("Weights: DISCARDED")
+        print("KV cache: DISCARDED")
+        print("CPU RAM: model weights are NOT backed up")
+        print("Use case: maximum memory release / weight replacement")
+        print("=" * 75)
 
     start = time.perf_counter()
 
@@ -79,14 +100,15 @@ def sleep_model(level=1):
 
     elapsed = time.perf_counter() - start
 
-    print(f"Sleep completed in: {elapsed:.3f} s")
+    print(f"\nSleep level {level} completed in {elapsed:.3f} s")
     print(f"is_sleeping: {is_sleeping()}")
 
     return elapsed
 
 
-def wake_model():
-    print("\nWaking model...")
+def wake_level_1():
+    print("\nWAKING FROM LEVEL 1")
+    print("Restoring model weights from CPU RAM -> GPU")
 
     start = time.perf_counter()
 
@@ -98,14 +120,102 @@ def wake_model():
 
     elapsed = time.perf_counter() - start
 
-    print(f"Wake completed in: {elapsed:.3f} s")
+    print(f"Level 1 wake completed in {elapsed:.3f} s")
     print(f"is_sleeping: {is_sleeping()}")
 
     return elapsed
 
 
-def run_inference(prompt):
-    print("\nRunning inference...")
+def wake_level_2():
+    print("\n" + "=" * 75)
+    print("WAKING FROM LEVEL 2")
+    print("Level 2 discarded the weights completely.")
+    print("Therefore wake requires:")
+    print("  1. Reallocate GPU memory for weights")
+    print("  2. Reload model weights")
+    print("  3. Reallocate KV cache")
+    print("=" * 75)
+
+    total_start = time.perf_counter()
+
+    # ------------------------------------------------------------------
+    # Step 1: reallocate GPU memory for weights
+    # ------------------------------------------------------------------
+
+    print("\n[1/3] Reallocating GPU weight memory...")
+
+    start = time.perf_counter()
+
+    response = requests.post(
+        f"{VLLM_URL}/wake_up",
+        params=[("tags", "weights")],
+        timeout=600,
+    )
+    response.raise_for_status()
+
+    weight_alloc_time = time.perf_counter() - start
+
+    print(f"Weight memory allocation: {weight_alloc_time:.3f} s")
+
+
+    # ------------------------------------------------------------------
+    # Step 2: reload weights
+    # ------------------------------------------------------------------
+
+    print("\n[2/3] Reloading model weights...")
+
+    start = time.perf_counter()
+
+    response = requests.post(
+        f"{VLLM_URL}/collective_rpc",
+        json={"method": "reload_weights"},
+        timeout=1200,
+    )
+    response.raise_for_status()
+
+    reload_time = time.perf_counter() - start
+
+    print(f"Weight reload: {reload_time:.3f} s")
+
+
+    # ------------------------------------------------------------------
+    # Step 3: reallocate KV cache
+    # ------------------------------------------------------------------
+
+    print("\n[3/3] Reallocating KV cache...")
+
+    start = time.perf_counter()
+
+    response = requests.post(
+        f"{VLLM_URL}/wake_up",
+        params=[("tags", "kv_cache")],
+        timeout=600,
+    )
+    response.raise_for_status()
+
+    kv_time = time.perf_counter() - start
+
+    print(f"KV cache allocation: {kv_time:.3f} s")
+
+    total_time = time.perf_counter() - total_start
+
+    print(f"\nLevel 2 complete wake: {total_time:.3f} s")
+    print(f"is_sleeping: {is_sleeping()}")
+
+    return {
+        "weight_alloc": weight_alloc_time,
+        "reload_weights": reload_time,
+        "kv_cache": kv_time,
+        "total": total_time,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+def run_inference(prompt: str, label: str):
+    print(f"\nRunning inference: {label}")
 
     start = time.perf_counter()
 
@@ -113,68 +223,215 @@ def run_inference(prompt):
 
     elapsed = time.perf_counter() - start
 
-    print(f"Inference completed in: {elapsed:.3f} s")
+    print(f"Inference time: {elapsed:.3f} s")
     print(f"Response: {response.content[:300]}")
 
     return elapsed
 
 
 # ---------------------------------------------------------------------------
-# Test
+# Level 1 test
+# ---------------------------------------------------------------------------
+
+def test_level_1():
+
+    print("\n\n")
+    print("#" * 75)
+    print("TEST 1: SLEEP LEVEL 1")
+    print("#" * 75)
+
+    print("""
+LEVEL 1 BEHAVIOR
+----------------
+GPU weights -> moved to CPU RAM
+KV cache    -> discarded
+
+Advantages:
+  + Fast wake-up
+  + Same model can immediately be restored
+
+Disadvantage:
+  - Requires enough CPU RAM for the model weights
+""")
+
+    print_gpu_status("Level 1 - before inference")
+
+    inference_before = run_inference(
+        "What is the capital of Germany? Answer briefly.",
+        "before Level 1 sleep",
+    )
+
+    print_gpu_status("Level 1 - before sleep")
+
+    sleep_time = sleep_model(level=1)
+
+    time.sleep(2)
+
+    print_gpu_status("Level 1 - sleeping")
+
+    wake_time = wake_level_1()
+
+    time.sleep(2)
+
+    print_gpu_status("Level 1 - after wake")
+
+    inference_after = run_inference(
+        "What is the capital of France? Answer briefly.",
+        "after Level 1 wake",
+    )
+
+    return {
+        "sleep": sleep_time,
+        "wake": wake_time,
+        "inference_before": inference_before,
+        "inference_after": inference_after,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Level 2 test
+# ---------------------------------------------------------------------------
+
+def test_level_2():
+
+    print("\n\n")
+    print("#" * 75)
+    print("TEST 2: SLEEP LEVEL 2")
+    print("#" * 75)
+
+    print("""
+LEVEL 2 BEHAVIOR
+----------------
+GPU weights -> discarded
+KV cache    -> discarded
+
+Advantages:
+  + Maximum GPU memory release
+  + Does not require CPU RAM to hold model weights
+
+Disadvantages:
+  - Model weights must be loaded again
+  - Wake-up is therefore more expensive
+  - Mainly intended for weight updates / model replacement
+""")
+
+    print_gpu_status("Level 2 - before inference")
+
+    inference_before = run_inference(
+        "What is the capital of Italy? Answer briefly.",
+        "before Level 2 sleep",
+    )
+
+    print_gpu_status("Level 2 - before sleep")
+
+    sleep_time = sleep_model(level=2)
+
+    time.sleep(2)
+
+    print_gpu_status("Level 2 - sleeping")
+
+    wake_stats = wake_level_2()
+
+    time.sleep(2)
+
+    print_gpu_status("Level 2 - after complete wake")
+
+    inference_after = run_inference(
+        "What is the capital of Spain? Answer briefly.",
+        "after Level 2 reload",
+    )
+
+    return {
+        "sleep": sleep_time,
+        "wake": wake_stats["total"],
+        "weight_alloc": wake_stats["weight_alloc"],
+        "reload_weights": wake_stats["reload_weights"],
+        "kv_cache": wake_stats["kv_cache"],
+        "inference_before": inference_before,
+        "inference_after": inference_after,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
 
-    print("\nINITIAL STATE")
-    print(f"is_sleeping: {is_sleeping()}")
+    print("\n" + "=" * 75)
+    print("vLLM SLEEP MODE BENCHMARK")
+    print("=" * 75)
 
-    print_gpu_status("Before inference")
+    print(f"Server: {VLLM_URL}")
+    print(f"Model:  {MODEL}")
+    print(f"Initial is_sleeping: {is_sleeping()}")
 
-    # 1. Warm inference
-    inference_before = run_inference(
-        "What is the capital of Germany? Answer in one sentence."
-    )
+    level1 = test_level_1()
 
-    print_gpu_status("After inference")
+    # Ensure the model is fully operational before starting level 2
+    time.sleep(3)
 
-
-    # 2. Sleep
-    sleep_time = sleep_model(level=1)
-
-    # Give nvidia-smi a moment to reflect released allocations
-    time.sleep(2)
-
-    print_gpu_status("After sleep")
-
-
-    # 3. Wake
-    wake_time = wake_model()
-
-    time.sleep(2)
-
-    print_gpu_status("After wake")
-
-
-    # 4. Verify inference still works
-    inference_after = run_inference(
-        "What is the capital of France? Answer in one sentence."
-    )
-
-    print_gpu_status("After post-wake inference")
+    level2 = test_level_2()
 
 
     # -----------------------------------------------------------------------
-    # Summary
+    # Final comparison
     # -----------------------------------------------------------------------
 
-    print("\n" + "=" * 70)
-    print("RESULTS")
-    print("=" * 70)
+    print("\n\n")
+    print("=" * 75)
+    print("FINAL COMPARISON")
+    print("=" * 75)
 
-    print(f"Sleep time:               {sleep_time:.3f} s")
-    print(f"Wake time:                {wake_time:.3f} s")
-    print(f"Inference before sleep:   {inference_before:.3f} s")
-    print(f"Inference after wake:     {inference_after:.3f} s")
+    print(
+        f"""
+LEVEL 1
+-------
+Weights kept in CPU RAM
+KV cache discarded
+
+Sleep time:              {level1['sleep']:.3f} s
+Wake time:               {level1['wake']:.3f} s
+Inference before sleep:  {level1['inference_before']:.3f} s
+Inference after wake:    {level1['inference_after']:.3f} s
+
+
+LEVEL 2
+-------
+Weights discarded
+KV cache discarded
+Weights must be reloaded before inference
+
+Sleep time:              {level2['sleep']:.3f} s
+
+Wake breakdown:
+  Allocate weight VRAM:  {level2['weight_alloc']:.3f} s
+  Reload weights:        {level2['reload_weights']:.3f} s
+  Allocate KV cache:     {level2['kv_cache']:.3f} s
+
+Total Level 2 wake:      {level2['wake']:.3f} s
+
+Inference before sleep:  {level2['inference_before']:.3f} s
+Inference after reload:  {level2['inference_after']:.3f} s
+"""
+    )
+
+    print("=" * 75)
+    print("INTERPRETATION")
+    print("=" * 75)
+
+    print("""
+Level 1:
+  Best equivalent to temporarily unloading an Ollama model.
+  The GPU is freed, but the weights remain backed up in CPU RAM.
+  Waking should therefore be relatively fast.
+
+Level 2:
+  More aggressive.
+  Both model weights and KV cache are discarded.
+  CPU RAM pressure is lower, but weights must be reloaded.
+  This is primarily intended for RLHF / weight updates / model replacement.
+""")
 
 
 if __name__ == "__main__":
