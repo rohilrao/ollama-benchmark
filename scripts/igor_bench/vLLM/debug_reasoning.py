@@ -1,3 +1,40 @@
+uv run src/vLLM/debug_reasoning.py 
+=== RAW SSE (first 5 data lines) ===
+{"id":"chatcmpl-919b13ab4ff836ac","object":"chat.completion.chunk","created":1788338477,"model":"/models/qwen235b","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+{"id":"chatcmpl-919b13ab4ff836ac","object":"chat.completion.chunk","created":1788338477,"model":"/models/qwen235b","choices":[{"index":0,"delta":{"reasoning":"\n"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+{"id":"chatcmpl-919b13ab4ff836ac","object":"chat.completion.chunk","created":1788338477,"model":"/models/qwen235b","choices":[{"index":0,"delta":{"reasoning":"Okay"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+{"id":"chatcmpl-919b13ab4ff836ac","object":"chat.completion.chunk","created":1788338477,"model":"/models/qwen235b","choices":[{"index":0,"delta":{"reasoning":","},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+{"id":"chatcmpl-919b13ab4ff836ac","object":"chat.completion.chunk","created":1788338477,"model":"/models/qwen235b","choices":[{"index":0,"delta":{"reasoning":" so"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+=== RAW: fields seen in delta across whole stream ===
+{'reasoning', 'content', 'role'}
+RAW reasoning_content text: ''
+RAW content text:          ''
+
+=== CLIENT (openai AsyncOpenAI) ===
+getattr fields kept (model_dump): {'refusal', 'content', 'role', 'reasoning', 'function_call', 'tool_calls'}
+getattr(delta, 'reasoning_content') text: ''
+model_dump()['reasoning_content'] text:   ''
+getattr(delta, 'content') text:           ''
+
+=== DIAGNOSIS ===
+Server never sent reasoning_content on the wire. Check for <think> tags inside RAW content_text above, and confirm enable_thinking is actually reaching the chat template.
+an error occurred during closing of asynchronous generator <async_generator object PoolByteStream.__aiter__ at 0x7f1ee4643f10>
+asyncgen: <async_generator object PoolByteStream.__aiter__ at 0x7f1ee4643f10>
+Traceback (most recent call last):
+  File "/home/rrao/projectcode/inference-bench/inference-bench/.venv/lib64/python3.13/site-packages/httpcore2/_async/connection_pool.py", line 427, in __aiter__
+    yield chunk
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/rrao/projectcode/inference-bench/inference-bench/.venv/lib64/python3.13/site-packages/httpcore2/_async/connection_pool.py", line 425, in __aiter__
+    async with safe_async_iterate(self._stream) as iterator:
+               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.13/contextlib.py", line 271, in __aexit__
+    raise RuntimeError("generator didn't stop after athrow()")
+RuntimeError: generator didn't stop after athrow()
 """
 Runs the SAME request two ways and compares what each path sees:
 
