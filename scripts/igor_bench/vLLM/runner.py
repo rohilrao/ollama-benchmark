@@ -65,7 +65,7 @@ async def stream_request(client: AsyncOpenAI, req_id: int, prompt: str,
                 continue
 
             delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             content = getattr(delta, "content", None)
 
             if reasoning:
