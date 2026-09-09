@@ -1,0 +1,11 @@
+podman run --rm -it \
+  --device nvidia.com/gpu=all \
+  --ipc=host \
+  -p 8555:8000 \
+  -v /projects/models/pixtral-12b-2409:/models/pixtral:ro \
+  docker.io/vllm/vllm-openai:latest \
+  --model /models/pixtral \
+  --tensor-parallel-size 4 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.10 \
+  --trust-remote-code
