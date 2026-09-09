@@ -12,3 +12,70 @@ podman run --rm -it \
   --dtype float16 \
   --gpu-memory-utilization 0.05 \
   --max-num-seqs 128
+
+
+from openai import OpenAI
+
+
+client = OpenAI(
+    base_url="http://localhost:8556/v1",
+    api_key="EMPTY",
+)
+
+model = "multilingual-e5-large-instruct"
+
+
+# Embed a retrieval query.
+task = (
+    "Given a question about nuclear decommissioning and licensing, "
+    "retrieve relevant document passages that answer the question"
+)
+
+query = (
+    f"Instruct: {task}\n"
+    "Query: Welche Unterlagen sind für den Abbau kerntechnischer "
+    "Anlagen erforderlich?"
+)
+
+query_response = client.embeddings.create(
+    model=model,
+    input=[query],
+)
+
+query_embeddings = [
+    item.embedding
+    for item in query_response.data
+]
+
+
+# Embed retrieval documents without adding the query instruction.
+documents = [
+    (
+        "Der Antragsteller muss die für das Genehmigungsverfahren "
+        "erforderlichen Unterlagen einreichen."
+    ),
+    "Die Anlage befindet sich seit 2019 im sicheren Einschluss.",
+]
+
+document_response = client.embeddings.create(
+    model=model,
+    input=documents,
+)
+
+document_embeddings = [
+    item.embedding
+    for item in document_response.data
+]
+
+
+query_shape = (
+    len(query_embeddings),
+    len(query_embeddings[0]),
+)
+document_shape = (
+    len(document_embeddings),
+    len(document_embeddings[0]),
+)
+
+print("Query embeddings shape:", query_shape)
+print("Document embeddings shape:", document_shape)
