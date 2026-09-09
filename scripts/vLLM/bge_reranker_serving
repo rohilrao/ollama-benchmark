@@ -1,0 +1,74 @@
+podman run --rm -it \
+  --name vllm-bge-reranker \
+  --device nvidia.com/gpu=0 \
+  --ipc=host \
+  -p 8557:8000 \
+  -v /projects/models/bge-reranker-v2-m3:/models/bge-reranker:ro \
+  docker.io/vllm/vllm-openai:latest \
+  --model /models/bge-reranker \
+  --served-model-name bge-reranker-v2-m3 \
+  --runner pooling \
+  --max-model-len 512 \
+  --dtype float16 \
+  --gpu-memory-utilization 0.05 \
+  --max-num-seqs 128
+
+  *****
+
+  import requests
+
+
+BASE_URL = "http://localhost:8557"
+MODEL = "bge-reranker-v2-m3"
+
+query = (
+    "Welche Unterlagen sind für den Abbau "
+    "kerntechnischer Anlagen erforderlich?"
+)
+
+documents = [
+    "Der Antragsteller muss die erforderlichen Unterlagen einreichen.",
+    "Die Anlage befindet sich seit 2019 im sicheren Einschluss.",
+    "Für den Abbau sind Sicherheitsberichte und "
+    "Strahlenschutzunterlagen vorzulegen.",
+]
+
+
+def test_endpoint(endpoint, payload):
+    try:
+        response = requests.post(
+            f"{BASE_URL}{endpoint}",
+            json=payload,
+            timeout=60,
+        )
+        response.raise_for_status()
+
+        print(f"{endpoint}: works")
+        print(response.json())
+
+    except requests.RequestException as error:
+        print(f"{endpoint}: does not work")
+        print(error)
+
+        if error.response is not None:
+            print(error.response.text)
+
+
+test_endpoint(
+    "/v1/score",
+    {
+        "model": MODEL,
+        "queries": query,
+        "documents": documents,
+    },
+)
+
+test_endpoint(
+    "/v1/rerank",
+    {
+        "model": MODEL,
+        "query": query,
+        "documents": documents,
+        "top_n": len(documents),
+    },
+)
