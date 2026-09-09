@@ -1,0 +1,14 @@
+podman run --rm -it \
+  --name vllm-e5 \
+  --device nvidia.com/gpu=0 \
+  --ipc=host \
+  -p 8556:8000 \
+  -v /projects/models/multilingual-e5-large-instruct:/models/e5:ro \
+  docker.io/vllm/vllm-openai:latest \
+  --model /models/e5 \
+  --served-model-name multilingual-e5-large-instruct \
+  --runner pooling \
+  --max-model-len 512 \
+  --dtype float16 \
+  --gpu-memory-utilization 0.05 \
+  --max-num-seqs 128
