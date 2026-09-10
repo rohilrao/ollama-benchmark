@@ -1,0 +1,35 @@
+podman run --rm -it \
+  --name vllm-surya \
+  --device nvidia.com/gpu=0 \
+  --ipc=host \
+  -p 8558:8000 \
+  -v /projects/models/hf/surya-ocr-2:/models/surya-ocr-2:ro \
+  docker.io/vllm/vllm-openai:v0.20.1 \
+  --model /models/surya-ocr-2 \
+  --served-model-name surya-ocr-2 \
+  --dtype bfloat16 \
+  --max-model-len 18000 \
+  --gpu-memory-utilization 0.15 \
+  --max-num-seqs 16
+
+export SURYA_INFERENCE_BACKEND=vllm
+export SURYA_INFERENCE_URL=http://localhost:8558/v1
+export SURYA_INFERENCE_PARALLEL=16
+
+from PIL import Image
+
+from surya.inference import SuryaInferenceManager
+from surya.recognition import RecognitionPredictor
+
+
+manager = SuryaInferenceManager()
+predictor = RecognitionPredictor(manager)
+
+image = Image.open("page.png")
+
+results = predictor(
+    [image],
+    full_page=True,
+)
+
+print(results[0])
