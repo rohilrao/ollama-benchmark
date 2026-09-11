@@ -4,3 +4,19 @@ PARSER qwen3-vl-instruct
 PARAMETER temperature 1
 PARAMETER top_k 20
 PARAMETER top_p 0.95
+
+### test like so: ###
+import ollama
+
+response = ollama.chat(
+    model="qwen3-vl:32b-instruct",
+    messages=[
+        {
+            "role": "user",
+            "content": "Describe this image.",
+            "images": ["/home/user/test.jpg"],
+        }
+    ],
+)
+
+print(response["message"]["content"])
